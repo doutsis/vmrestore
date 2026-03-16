@@ -1,0 +1,12 @@
+# Editor files
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+build/
+*.deb

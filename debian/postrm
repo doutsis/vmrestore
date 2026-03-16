@@ -1,0 +1,21 @@
+#!/bin/bash
+# postrm — runs after package removal
+set -e
+
+case "$1" in
+    remove)
+        # Remove symlink
+        rm -f /usr/local/bin/vmrestore
+
+        echo "vmrestore removed."
+        echo "To fully clean up: rm -rf /opt/vmrestore /var/log/vmrestore"
+        ;;
+    purge)
+        # Full cleanup
+        rm -f /usr/local/bin/vmrestore
+        rm -rf /var/log/vmrestore
+        echo "vmrestore purged."
+        ;;
+esac
+
+exit 0

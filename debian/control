@@ -1,0 +1,13 @@
+Package: vmrestore
+Version: __VERSION__
+Architecture: all
+Maintainer: James Doutsis <james@doutsis.com>
+Depends: bash (>= 5.0), libvirt-daemon-system, qemu-utils, coreutils
+Recommends: virtnbdbackup (>= 2.28)
+Section: admin
+Priority: optional
+Description: Automated VM restoration tool for libvirt/KVM virtual machines
+ Wraps virtnbdrestore to provide orchestrated VM restoration from vmbackup
+ backup sets. Supports full, incremental, and copy backup types with
+ point-in-time recovery, new-identity cloning, TPM/NVRAM state restoration,
+ pre-flight space and disk safety checks, and archived chain recovery.

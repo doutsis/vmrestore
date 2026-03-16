@@ -1,0 +1,40 @@
+#!/bin/bash
+# postinst — runs after package installation
+set -e
+
+case "$1" in
+    configure)
+        # Create symlink in PATH
+        ln -sf /opt/vmrestore/vmrestore.sh /usr/local/bin/vmrestore
+
+        # Ownership: root:libvirt — same group used by libvirt for VM management
+        if getent group libvirt >/dev/null 2>&1; then
+            chown -R root:libvirt /opt/vmrestore
+        else
+            chown -R root:root /opt/vmrestore
+        fi
+        chmod 750 /opt/vmrestore
+
+        # Create log directory
+        mkdir -p /var/log/vmrestore
+        if getent group libvirt >/dev/null 2>&1; then
+            chown root:libvirt /var/log/vmrestore
+        fi
+        chmod 750 /var/log/vmrestore
+
+        VERSION=$(grep '^readonly VERSION=' /opt/vmrestore/vmrestore.sh | sed 's/.*"\(.*\)"/\1/')
+        echo ""
+        echo "=== vmrestore ${VERSION} installed ==="
+        echo ""
+        echo "  Install path:  /opt/vmrestore/"
+        echo "  Command:       vmrestore --help"
+        echo "  Logs:          /var/log/vmrestore/"
+        echo ""
+        echo "  Quick start:"
+        echo "    vmrestore --list"
+        echo "    vmrestore --vm <name> --restore-path /tmp/restore --dry-run"
+        echo ""
+        ;;
+esac
+
+exit 0
