@@ -64,9 +64,10 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmres
 14. [Instant Boot from Backup](#14-instant-boot-from-backup)
 15. [Verifying Backups Before Restore](#15-verifying-backups-before-restore)
 16. [Post-Restore Steps](#16-post-restore-steps)
-17. [Troubleshooting](#17-troubleshooting)
-18. [Quick Reference Commands](#18-quick-reference-commands)
-19. [Changelog](#19-changelog) *(see [CHANGELOG.md](CHANGELOG.md))*
+17. [Storage Cleanup with --prune (vmbackup)](#17-storage-cleanup-with---prune-vmbackup)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Quick Reference Commands](#19-quick-reference-commands)
+20. [Changelog](#20-changelog) *(see [CHANGELOG.md](CHANGELOG.md))*
 
 ---
 
@@ -1995,7 +1996,135 @@ sudo virsh edit {vm-name}
 ```
 
 ---
-## 17. Troubleshooting
+
+## 17. Storage Cleanup with `--prune` (vmbackup)
+
+> `--prune` is a vmbackup command, not vmrestore. It is documented here because backup cleanup is part of the operational lifecycle — you restore, verify, then clean up old data you no longer need.
+
+As backups accumulate over weeks and months, archived chains consume significant storage. Automated retention handles count-based cleanup after each backup run, but sometimes you need to free space on your own terms — before enabling replication, after decommissioning a VM, or just to reclaim disk.
+
+`--prune` gives you targeted, operator-initiated deletion at granularities that automated retention doesn't offer.
+
+### The Workflow
+
+Every prune operation follows the same three-step pattern:
+
+```
+1. List    →  see what's using space
+2. Dry-run →  preview what would be removed
+3. Execute →  remove it (with confirmation prompt)
+```
+
+### Scenario: "I need to free space before enabling replication"
+
+Your replication destination has 400 GiB free but your backups total 530 GiB. Most of the space is archived chains you don't need for replication.
+
+```bash
+# Step 1: See the breakdown
+sudo vmbackup --prune list
+```
+
+The output shows per-VM totals with archive sizes. You spot one VM with 257 GiB in archives alone.
+
+```bash
+# Step 2: Drill into one VM
+sudo vmbackup --prune list --vm my-vm
+```
+
+This shows every period, every archived chain with its size, and copy-paste prune commands.
+
+```bash
+# Step 3: Preview removing all archives for that VM
+sudo vmbackup --prune archives --vm my-vm --dry-run
+```
+
+The dry run shows exactly what would be deleted and how much space would be freed — without touching anything.
+
+```bash
+# Step 4: Do it
+sudo vmbackup --prune archives --vm my-vm --yes
+```
+
+Active backup chains are untouched. The VM is still fully restorable from its current chain. Only the old archived chains are removed.
+
+### Scenario: "I decommissioned a VM and want to remove all its backup data"
+
+```bash
+# See what exists
+sudo vmbackup --prune list --vm old-vm
+
+# Preview the nuclear option
+sudo vmbackup --prune all --vm old-vm --dry-run
+
+# Remove everything — all periods, all archives, the entire VM directory
+sudo vmbackup --prune all --vm old-vm --yes
+```
+
+`all` overrides the keep-last guard that normally prevents you from removing the last period.
+
+### Scenario: "I want to remove one specific old archive chain"
+
+You had a chain break last week that created an 8 GiB archive. You've verified your current chain is healthy and want to reclaim the space.
+
+```bash
+# Find the chain name
+sudo vmbackup --prune list --vm my-vm
+
+# Preview
+sudo vmbackup --prune chain:chain-2026-01-14 --vm my-vm --dry-run
+
+# Remove just that one chain
+sudo vmbackup --prune chain:chain-2026-01-14 --vm my-vm --yes
+```
+
+### Scenario: "I want to clean up an old period but keep the current one"
+
+Your VM has periods from February and March. February is no longer needed.
+
+```bash
+# Preview
+sudo vmbackup --prune period:202602 --vm web-server --dry-run
+
+# Remove the entire February period (active chain + archives)
+sudo vmbackup --prune period:202602 --vm web-server --yes
+```
+
+The keep-last guard prevents you from accidentally deleting the last remaining period. If March is the only period left, a `--prune period:202603` will be blocked.
+
+### Scenario: "I want to remove all archives across every VM at once"
+
+Useful when archives are consuming the majority of storage and you only care about the current backup chains.
+
+```bash
+# Preview across all VMs
+sudo vmbackup --prune archives --dry-run
+
+# Remove all archived chains for all VMs
+sudo vmbackup --prune archives --yes
+```
+
+This walks every VM, every period, and removes `.archives/` directories. Active chains are never touched.
+
+### Target Reference
+
+| Target | What it removes | `--vm` required? |
+|--------|----------------|:---:|
+| `list` | Nothing — read-only discovery view | No |
+| `archives` | All archived chains across all periods | No (all VMs) or Yes (one VM) |
+| `archives:<period>` | Archived chains in one specific period | Yes |
+| `chain:<name>` | One specific archived chain | Yes |
+| `period:<period_id>` | Entire period directory (active + archives) | Yes |
+| `all` | Everything for a VM (all periods, entire directory) | Yes |
+
+### Safety
+
+- **Dry-run** (`--dry-run`) — preview without changes. Always available.
+- **Confirmation prompt** — interactive Y/N before any destructive operation. Bypass with `--yes` for scripting.
+- **Keep-last guard** — `period:` refuses to delete the last remaining period. Use `all` to explicitly remove everything.
+- **Audit trail** — every operation is logged to `vmprune.log` and recorded in the SQLite database (`chain_events`, `period_events`, `retention_events`, `file_operations`).
+
+---
+## 18. Troubleshooting
 
 ### Disk Collision Protection — "BLOCKED" Errors
 
@@ -2130,7 +2259,7 @@ sudo vmrestore --vm my-vm --restore-path /tmp/test --dry-run
 ```
 
 ---
-## 18. Quick Reference Commands
+## 19. Quick Reference Commands
 
 ### Inventory & Inspection
 
@@ -2256,7 +2385,7 @@ done
 
 ---
 
-## 19. Changelog
+## 20. Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 

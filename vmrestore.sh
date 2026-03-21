@@ -1239,6 +1239,7 @@ restore_vm() {
                 _space_check_dir=$(dirname "$_space_check_dir")
             done
             avail_bytes=$(df --output=avail -B1 "$_space_check_dir" 2>/dev/null | tail -1 | tr -d '[:space:]')
+            avail_bytes="${avail_bytes:-0}"
             if (( total_needed > avail_bytes )); then
                 local need_hr avail_hr
                 need_hr=$(numfmt --to=iec-i --suffix=B "$total_needed" 2>/dev/null || echo "$total_needed bytes")
