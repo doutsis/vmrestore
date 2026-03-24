@@ -281,6 +281,16 @@ done
 
 Full technical documentation is included in [vmrestore.md](vmrestore.md) (installed to `/opt/vmrestore/vmrestore.md`). It covers backup structure, rotation policies, restore scenarios, TPM/BitLocker/NVRAM handling, single-file recovery via virtnbdmap, troubleshooting and a quick reference command sheet.
 
+## Known Issues
+
+### `--disk` on single-disk VMs
+
+`vmrestore --disk` is designed for in-place disk replacement without touching the VM definition. However, on VMs with only one disk, vmrestore silently falls through to full-VM restore mode — which undefines the VM from libvirt. This is unexpected when the intent is to swap out a single disk file.
+
+**Workaround:** Use `--disk` only on multi-disk VMs. For single-disk VMs, use a standard DR restore instead.
+
+**Status:** Will be fixed in a future release. `--disk` on a single-disk VM should perform an in-place disk replacement, not a full-VM restore.
+
 ## Issues
 
 Found a bug or have a feature request? [Open an issue](https://github.com/doutsis/vmrestore/issues).
