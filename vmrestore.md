@@ -6,7 +6,7 @@
 >
 > Backups are only as good as your restores. All backups are worthless if you cannot recover from them.
 
-vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmrestore restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
+[vmbackup](https://github.com/doutsis/vmbackup) and vmrestore are two halves of one system. vmbackup backs up — vmrestore restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
 
 **vmrestore** is a single-command restore tool for libvirt/KVM virtual machines. It wraps `virtnbdrestore` to provide:
 
@@ -19,8 +19,8 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmres
 - Archived chain recovery for any rotation policy (daily, weekly, monthly, accumulate)
 - Dry-run mode to preview every restore before executing
 
-> **Version:** vmrestore.sh v0.5.1
-> **Underlying tools:** virtnbdrestore v2.28, virtnbdmap v2.28
+> **Version:** vmrestore v0.5.2
+> **Underlying tools:** virtnbdrestore v2.28
 
 ---
 
@@ -31,9 +31,8 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmres
 3. [How vmrestore Fits the vmbackup Ecosystem](#3-how-vmrestore-fits-the-vmbackup-ecosystem)
 4. [Understanding Your Backups](#4-understanding-your-backups)
     - [4.1 Rotation Policies](#41-rotation-policies)
-    - [4.2 On-Disk Backup Structure](#42-on-disk-backup-structure)
-    - [4.3 Backup Types and File Naming](#43-backup-types-and-file-naming)
-    - [4.4 Chains and Checkpoints](#44-chains-and-checkpoints)
+    - [4.2 Backup Types and File Naming](#42-backup-types-and-file-naming)
+    - [4.3 Chains and Checkpoints](#43-chains-and-checkpoints)
 5. [What vmrestore Detects Automatically](#5-what-vmrestore-detects-automatically)
 6. [Restore Types — DR, Clone and Disk](#6-restore-types--dr-clone-and-disk)
 7. [Choosing a Restore Path](#7-choosing-a-restore-path)
@@ -60,14 +59,10 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmres
     - [10.4 Accumulate Policy](#104-accumulate-policy)
 11. [TPM and BitLocker Restore](#11-tpm-and-bitlocker-restore)
 12. [UEFI/OVMF Firmware and NVRAM Restore](#12-uefiovmf-firmware-and-nvram-restore)
-13. [Single File Restore (virtnbdmap)](#13-single-file-restore-virtnbdmap)
-14. [Instant Boot from Backup](#14-instant-boot-from-backup)
-15. [Verifying Backups Before Restore](#15-verifying-backups-before-restore)
-16. [Post-Restore Steps](#16-post-restore-steps)
-17. [Storage Cleanup with --prune (vmbackup)](#17-storage-cleanup-with---prune-vmbackup)
-18. [Troubleshooting](#18-troubleshooting)
-19. [Quick Reference Commands](#19-quick-reference-commands)
-20. [Changelog](#20-changelog) *(see [CHANGELOG.md](CHANGELOG.md))*
+13. [Verifying Backups Before Restore](#13-verifying-backups-before-restore)
+14. [Post-Restore Steps](#14-post-restore-steps)
+15. [Troubleshooting](#15-troubleshooting)
+16. [Quick Reference Commands](#16-quick-reference-commands)
 
 ---
 
@@ -111,33 +106,33 @@ sudo vmrestore --vm my-vm --disk vdb --restore-path /tmp/extract
 ---
 ## 2. Installation
 
-vmrestore.sh is packaged as a Debian `.deb` package and can also be deployed manually as a standalone script.
+vmrestore is packaged as a Debian `.deb` package and can also be deployed manually as a standalone script.
 
 ### Prerequisites
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `virtnbdbackup` | ≥ 2.28 | Provides `virtnbdrestore` (disk restore engine) and `virtnbdmap` (single-file recovery) |
+| `virtnbdbackup` | ≥ 2.28 | Provides `virtnbdrestore` (disk restore engine) |
 | `libvirt-daemon-system` | — | `virsh` domain management |
 | `qemu-utils` | — | `qemu-img` for post-restore disk integrity checks |
-| `coreutils` | — | `numfmt`, `stat`, `df` for pre-flight space checks |
-| `bash` | ≥ 5.0 | Required for associative arrays and `${PIPESTATUS}` |
 
-**Optional (for single-file recovery only):**
+**Installing virtnbdbackup:**
 
-| Package | Purpose |
-|---------|---------|
-| `nbdkit` | Required for `virtnbdmap` single-file recovery |
-| `nbd-client` | Required for `virtnbdmap` (kernel `nbd` module) |
+```bash
+# Debian / Ubuntu
+sudo apt install virtnbdbackup
+
+# Or from source — see https://github.com/abbbi/virtnbdbackup
+```
 
 ### vmbackup Dependency
 
-vmrestore.sh depends on **vmbackup.sh** being installed and configured on the same host (or having access to vmbackup's backup storage). Specifically, vmrestore reads:
+vmrestore does **not** require [vmbackup](https://github.com/doutsis/vmbackup) to be installed. It needs two things:
 
-- **vmbackup's configuration** — to resolve the backup path (`BACKUP_PATH`) from vmbackup.conf
-- **vmbackup's on-disk backup structure** — the directory layout, `.data` files, config XMLs, TPM state, and NVRAM files that vmbackup.sh creates
+1. **Access to the backup storage** — the directory tree containing `.data` files, config XMLs, TPM state, and NVRAM files that vmbackup created
+2. **The backup path** — either passed explicitly via `--backup-path`, or resolved automatically from vmbackup's config file (`/opt/vmbackup/config/default/vmbackup.conf`) if vmbackup happens to be installed on the same host
 
-vmrestore does **not** source any vmbackup modules, does not write to vmbackup's database, and has no runtime coupling to vmbackup.sh itself. It is a self-contained script that understands vmbackup's output format.
+vmrestore does not source any vmbackup modules, does not write to vmbackup's database, and has no runtime coupling to vmbackup. It is a self-contained script that reads vmbackup's on-disk output format.
 
 ### From GitHub Release (.deb) — Recommended
 
@@ -218,7 +213,7 @@ vmrestore runs as **root** (it needs `virsh define`, `virsh undefine`, and write
 
 ### Backup Path Resolution
 
-vmrestore.sh resolves the backup root using a two-step cascade:
+vmrestore resolves the backup root using a two-step cascade:
 
 | Priority | Source | Example |
 |----------|--------|---------|
@@ -227,7 +222,7 @@ vmrestore.sh resolves the backup root using a two-step cascade:
 
 If neither provides a value, vmrestore exits with an error directing you to use `--backup-path` or configure vmbackup.
 
-If vmbackup.sh is already installed and configured, vmrestore.sh will automatically pick up its configuration — no additional setup is needed.
+If vmbackup is already installed and configured, vmrestore will automatically pick up its configuration — no additional setup is needed.
 
 ### Verify Installation
 
@@ -242,19 +237,18 @@ sudo vmrestore --list
 ---
 ## 3. How vmrestore Fits the vmbackup Ecosystem
 
-vmbackup and vmrestore are two halves of one system. vmbackup backs up — vmrestore restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
+[vmbackup](https://github.com/doutsis/vmbackup) and vmrestore are two halves of one system. vmbackup backs up — vmrestore restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
 
 | Component | Role | How It Connects |
 |-----------|------|-----------------------|
 | **vmbackup.sh** | Backup engine — scheduling, rotation, retention, replication | Orchestrates `virtnbdbackup` to create on-disk backup sets |
-| **virtnbdbackup** | Disk backup engine used by vmbackup.sh | Orchestrated by vmbackup.sh |
-| **vmrestore.sh** | Restore engine — identity management, TPM/NVRAM, pre-flight checks | Orchestrates `virtnbdrestore` to reconstruct VMs from vmbackup's output |
-| **virtnbdrestore** | Disk restore engine used by vmrestore.sh | Orchestrated by vmrestore.sh |
-| **virtnbdmap** | NBD-based backup mounting for single-file recovery | Standalone — not orchestrated by vmbackup or vmrestore |
+| **virtnbdbackup** | Disk backup engine used by vmbackup | Orchestrated by vmbackup |
+| **vmrestore** | Restore engine — identity management, TPM/NVRAM, pre-flight checks | Orchestrates `virtnbdrestore` to reconstruct VMs from vmbackup's output |
+| **virtnbdrestore** | Disk restore engine used by vmrestore | Orchestrated by vmrestore |
 
 ### What vmbackup Does
 
-vmbackup.sh is the **backup engine**. It handles everything before a restore is ever needed:
+vmbackup is the **backup engine**. It handles everything before a restore is ever needed:
 
 - Scheduling and running backups (via systemd timer or cron)
 - Choosing full vs incremental based on rotation policy
@@ -266,7 +260,7 @@ vmbackup.sh is the **backup engine**. It handles everything before a restore is 
 
 ### What vmrestore Does
 
-vmrestore.sh is the **restore engine**. It reads what vmbackup created and reconstructs the VM:
+vmrestore is the **restore engine**. It reads what vmbackup created and reconstructs the VM:
 
 - Locating and validating backup data on disk
 - Auto-detecting backup type, period, restore points, and chain layout
@@ -279,22 +273,22 @@ vmrestore.sh is the **restore engine**. It reads what vmbackup created and recon
 
 vmrestore has a clear boundary. It does not:
 
-- **Create backups** — that's vmbackup.sh
+- **Create backups** — that's vmbackup
 - **Schedule anything** — no timers, no cron, no recurring jobs
 - **Manage retention or cleanup** — it never deletes backup data
 - **Write to vmbackup's database** — restores are not tracked in SQLite
-- **Share code with vmbackup** — it does not source vmbackup.sh modules and has no runtime dependency on vmbackup.sh being present
+- **Share code with vmbackup** — it does not source vmbackup modules and has no runtime dependency on vmbackup being present
 
 vmrestore is read-only with respect to your backup storage. It reads vmbackup's on-disk structure and configuration, but never modifies them.
 
 ---
 ## 4. Understanding Your Backups
 
-Before restoring, it helps to understand what vmbackup created. This section covers the backup structure, file naming, and chain mechanics that vmrestore works with.
+Before restoring, it helps to understand what [vmbackup](https://github.com/doutsis/vmbackup) created. This section covers the backup structure, file naming, and chain mechanics that vmrestore works with.
 
 ### 4.1 Rotation Policies
 
-vmbackup.sh uses `virtnbdbackup` in **hybrid** mode to create online, thin-provisioned backups via libvirt's changed block tracking (dirty bitmaps). Each VM gets its own directory tree under the backup root.
+vmbackup uses `virtnbdbackup` in **hybrid** mode to create online, thin-provisioned backups via libvirt's changed block tracking (dirty bitmaps). Each VM gets its own directory tree under the backup root.
 
 #### Policies
 
@@ -305,7 +299,7 @@ vmbackup.sh uses `virtnbdbackup` in **hybrid** mode to create online, thin-provi
 | Monthly    | `YYYYMM`        | 1st of month or new chain | Rest of the month      | `file-server/202602/`   |
 | Accumulate | (none)          | First run only            | All subsequent backups  | `appliance/` (flat, no subdirs) |
 
-#### How vmbackup.sh Decides Backup Type
+#### How vmbackup Decides Backup Type
 
 1. **Day 1 of period** (or empty target dir): `virtnbdbackup -l full` — creates a full baseline and checkpoint `virtnbdbackup.0`
 2. **Subsequent days in period**: `virtnbdbackup -l auto` — virtnbdbackup detects the existing full backup and automatically creates an incremental, adding checkpoint `virtnbdbackup.N`
@@ -325,80 +319,7 @@ Each period directory (e.g., `202602/` or `20260222/`) — or the VM root for ac
 
 ---
 
-### 4.2 On-Disk Backup Structure
-
-#### Backup Root Layout
-
-```
-/mnt/backups/vm/                 # BACKUP_PATH from vmbackup.conf
-├── __HOST_CONFIG__/             # Host-level /etc/libvirt configuration
-├── _state/                      # vmbackup.sh state (DB, logs)
-│   ├── vmbackup.db              # SQLite tracking database
-│   └── logs/                    # Per-backup log files
-├── my-vm/                   # VM: my-vm (weekly policy)
-│   ├── chain-manifest.json      # Full chain history for this VM
-│   └── 2026-W09/                # Weekly period directory
-│       ├── vda.full.data                    # FULL baseline
-│       ├── vda.full.data.chksum             # Checksum (adler32)
-│       ├── vda.inc.virtnbdbackup.1.data     # Incremental #1
-│       ├── vda.inc.virtnbdbackup.1.data.chksum
-│       ├── vda.inc.virtnbdbackup.2.data     # Incremental #2
-│       ├── vda.inc.virtnbdbackup.2.data.chksum
-│       ├── vda.virtnbdbackup.0.qcow.json   # QCOW metadata per checkpoint
-│       ├── vda.virtnbdbackup.1.qcow.json
-│       ├── vda.virtnbdbackup.2.qcow.json
-│       ├── vmconfig.virtnbdbackup.0.xml     # VM config at checkpoint 0
-│       ├── vmconfig.virtnbdbackup.1.xml     # VM config at checkpoint 1
-│       ├── vmconfig.virtnbdbackup.2.xml     # VM config at checkpoint 2
-│       ├── my-vm.cpt                    # Checkpoint list
-│       ├── checkpoints/                     # Libvirt checkpoint XMLs
-│       │   ├── virtnbdbackup.0.xml
-│       │   ├── virtnbdbackup.1.xml
-│       │   └── virtnbdbackup.2.xml
-│       ├── config/                          # vmbackup.sh saved VM configs
-│       │   ├── my-vm_config_202602_FIRST.xml
-│       │   └── my-vm_config_20260220_023045.xml
-│       ├── .archives/                       # Old chains (archived by vmbackup.sh)
-│       │   └── chain-2026-02-20/            # Previous chain data files
-│       ├── .full-backup-month               # Month marker
-│       └── .agent-status                    # QEMU agent status (yes/no)
-├── web-server/              # VM: web-server (daily policy, UEFI+TPM)
-│   ├── chain-manifest.json
-│   ├── 20260221/                # Daily FULL backup
-│   │   ├── sda.full.data
-│   │   ├── OVMF_CODE_4M.ms.fd.virtnbdbackup.0
-│   │   ├── web-server_VARS.fd.virtnbdbackup.0
-│   │   ├── tpm-state/
-│   │   │   ├── tpm2/                       # TPM state directory
-│   │   │   ├── BACKUP_METADATA.txt         # VM UUID for TPM mapping
-│   │   │   └── bitlocker-recovery-keys.txt # BitLocker keys (if applicable)
-│   │   └── ...
-│   └── 20260222/                # Daily FULL backup (latest)
-│       └── ...
-├── file-server/                # VM: file-server (monthly policy, multi-disk)
-│   └── 202602/
-│       ├── vda.full.data                    # System disk
-│       ├── vdb.full.data                    # Data disk
-│       └── ...
-└── appliance/                  # VM: appliance (accumulate policy)
-    ├── vda.full.data                        # First-ever FULL (no period subdir)
-    ├── vda.inc.virtnbdbackup.1.data         # Incremental #1
-    └── ...
-```
-
-#### Disk Names
-
-vmbackup.sh uses the **libvirt device target names** (vda, vdb, sda, sdb, etc.) as found in the VM's XML configuration. These are determined by the VM's virtual hardware:
-
-| Bus Type | Naming | Example |
-|----------|--------|---------|
-| VirtIO | `vda`, `vdb`, ... | Most Linux VMs |
-| SATA/IDE | `sda`, `sdb`, ... | Windows VMs, UEFI VMs with SATA controllers |
-| SCSI | `sda`, `sdb`, ... | VMs with VirtIO SCSI controller |
-
----
-
-### 4.3 Backup Types and File Naming
+### 4.2 Backup Types and File Naming
 
 | Type | File Pattern | Created When |
 |------|-------------|-------------|
@@ -410,7 +331,7 @@ Each `.data` file has a corresponding `.data.chksum` file containing an adler32 
 
 ---
 
-### 4.4 Chains and Checkpoints
+### 4.3 Chains and Checkpoints
 
 #### What is a Chain?
 
@@ -427,12 +348,12 @@ Chain start:  vda.full.data                   ← Checkpoint 0 (cp0) — FULL ba
 
 #### When Does a Chain Break?
 
-vmbackup.sh archives the current chain and starts fresh when:
+vmbackup archives the current chain and starts fresh when:
 - Backup chain corruption is detected
 - Backup policy changes (e.g., monthly → daily)
 - Manual chain break
 
-Archived chains are moved to `.archives/chain-YYYY-MM-DD[.N]/` within the period directory. They remain fully restorable via vmrestore.sh.
+Archived chains are moved to `.archives/chain-YYYY-MM-DD[.N]/` within the period directory. They remain fully restorable via vmrestore.
 
 ---
 
@@ -564,11 +485,11 @@ See [section 9.10](#910-disk-restore---disk) for full details including point-in
 
 ### Multi-Disk VMs
 
-vmrestore handles multi-disk VMs automatically in all three restore types. If a backup contains data files for more than one disk (e.g. `vda.full.data` and `vdb.full.data`), DR and clone restores process all of them in a single run. Disk restore lets you pick specific disks with `--disk`.
+vmrestore handles multi-disk VMs automatically in all three restore types. If a backup contains data files for more than one disk (e.g. `vda.full.data` and `vdb.full.data`), DR and clone restores process all of them in a single run. Disk restore (`--disk`) works for both single-disk and multi-disk VMs — specify individual disks or use `--disk all`.
 
 #### How Disk Naming Works
 
-vmbackup names backup data files using the **libvirt device target** — the bus address assigned by the hypervisor. A VM with a VirtIO system disk and a SATA data disk produces files named `vda.full.data` and `sda.full.data`. vmrestore reads these names and uses them to construct the final output filenames.
+[vmbackup](https://github.com/doutsis/vmbackup) names backup data files using the **libvirt device target** — the bus address assigned by the hypervisor. A VM with a VirtIO system disk and a SATA data disk produces files named `vda.full.data` and `sda.full.data`. vmrestore reads these names and uses them to construct the final output filenames.
 
 The naming convention for restored disk images depends on the restore type:
 
@@ -736,7 +657,7 @@ sudo vmrestore --list-restore-points my-vm
 sudo vmrestore --list-restore-points my-vm --period 2026-W09
 ```
 
-Shows every retention period with its numbered restore points, dates, types (FULL, Incremental, COPY), available disks, and any archived chains (with their restore points expanded inline). No log files are created for read-only commands.
+Shows every retention period with its numbered restore points, dates, types (FULL, Incremental, COPY), per-checkpoint disk set, and any archived chains (with their restore points expanded inline). No log files are created for read-only commands.
 
 ### 9.3 Disaster Recovery Restore (DR)
 
@@ -779,6 +700,25 @@ sudo vmrestore --vm my-vm --restore-point 3 \
 sudo vmrestore --vm my-vm --restore-point full \
   --restore-path /var/lib/libvirt/images
 ```
+
+#### Disk Configuration Changes Between Checkpoints
+
+When a disk is removed from a VM mid-chain, the backup chain remains valid — earlier checkpoints still contain all the data for that disk. vmrestore detects when the target restore point has a different disk set from the latest checkpoint and automatically handles the restore:
+
+- A staging directory is created with symlinks to the backup data files and the correct `vmconfig` for the target checkpoint
+- `virtnbdrestore` sees only the target checkpoint's disk configuration, so all disks present at that point are restored
+- The user sees a warning explaining the disk configuration change:
+
+```
+WARNING: Disk configuration changed between checkpoint 2 and the latest checkpoint (3).
+  Checkpoint 2: sda, vda, vdb (3 disks)
+  Latest (CP 3): vda, vdb (2 disks)
+  Restoring with checkpoint 2 disk configuration.
+```
+
+This applies to DR, clone, and disk restore modes equally, and works with both active and archived chains. In dry-run mode, the staging intent is logged but no staging directory is created.
+
+**Note:** Disk additions cannot occur mid-chain — they trigger a chain break and a new full backup. Mid-chain disk configuration changes are always removals.
 
 ### 9.5 Path-Aware `--vm` (Direct Backup Path)
 
@@ -845,7 +785,7 @@ Without `--force`, vmrestore aborts if the target VM is already defined.
 
 ### 9.10 Disk Restore (`--disk`)
 
-Disk restore is the third restore mode alongside DR and Clone. It replaces or extracts one or more disks from a multi-disk backup without touching VM definitions, UUIDs, MAC addresses, TPM state, or NVRAM. Use it when disk(s) are corrupted but the VM definition and other disks are fine.
+Disk restore is the third restore mode alongside DR and Clone. It replaces or extracts one or more disks from a backup without touching VM definitions, UUIDs, MAC addresses, TPM state, or NVRAM. Works for both single-disk and multi-disk VMs. Use it when disk(s) are corrupted but the VM definition is fine.
 
 Supports single (`--disk vdb`), multiple (`--disk vda,vdb`), and all (`--disk all`) disks.
 
@@ -862,13 +802,13 @@ Supports single (`--disk vdb`), multiple (`--disk vda,vdb`), and all (`--disk al
 
 #### Discovering Available Disks
 
-Use `--list-restore-points` to see which disks are in a backup:
+Use `--list-restore-points` to see which disks are available at each checkpoint:
 
 ```bash
 sudo vmrestore --list-restore-points my-vm
 ```
 
-Output includes a `Disks:` line listing all available device names (e.g. `sda, vda, vdb`).
+Each restore point row includes a `Disk(s)` column showing which disks were backed up at that checkpoint. When disks are added or removed mid-chain, the column reflects the actual disk set at each point in time — so you can see exactly which disks are available before choosing a `--restore-point` or `--disk` target.
 
 #### Mode 1: In-Place Replacement
 
@@ -942,18 +882,17 @@ sudo vmrestore --vm my-vm --disk all --no-pre-restore
 
 #### Checkpoint Chain Invalidation
 
-Replacing a disk invalidates the QEMU checkpoint bitmaps that vmbackup uses for incremental backups. The next backup will detect the mismatch. What happens depends on your vmbackup `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` setting:
+Replacing a disk invalidates the QEMU checkpoint bitmaps that [vmbackup](https://github.com/doutsis/vmbackup) uses for incremental backups. The next backup will detect the mismatch.
 
-- **`yes`** — vmbackup auto-archives the old chain and starts a fresh FULL. No manual intervention.
-- **`warn`** (default) — vmbackup fails until you manually clean the stale checkpoints:
+By default, vmbackup's `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` is set to `yes` — it automatically archives the old chain and starts a fresh FULL backup. No manual intervention is needed.
+
+If auto-recovery has been disabled (`warn`), vmbackup will fail until you manually clean the stale checkpoints:
 
 ```bash
 for cp in $(virsh checkpoint-list my-vm --name 2>/dev/null); do
   virsh checkpoint-delete my-vm $cp --metadata
 done
 ```
-
-vmrestore logs both scenarios clearly so the admin knows what to expect.
 
 #### Point-in-Time Disk Restore
 
@@ -964,6 +903,14 @@ sudo vmrestore --vm my-vm --disk vdb --restore-point 2
 ```
 
 Restores the disk to the state at restore point 2, not the latest.
+
+When the requested disk exists at the target restore point but not at the latest checkpoint (i.e. the disk was removed mid-chain), vmrestore validates the disk against the target checkpoint's disk set and creates a staging directory with the correct `vmconfig` so `virtnbdrestore` can find the disk. If `--restore-point` is omitted and the requested disk is not at the latest checkpoint, vmrestore errors with a message showing which checkpoint the disk was last seen at:
+
+```
+ERROR: Disk 'sda' is not available at the latest restore point (checkpoint 3).
+       It was last backed up at checkpoint 2.
+       Use --restore-point 2 to restore sda from that checkpoint.
+```
 
 #### Multi-Disk Failure Handling
 
@@ -1035,7 +982,7 @@ This stops `libvirtd`, extracts the latest `__HOST_CONFIG__` tar.gz archive to `
 ---
 ## 10. Restore Walkthroughs by Policy
 
-These walkthroughs show what vmbackup produces on disk for each rotation policy and how to list, understand, and restore from those backups. Section 9 gives quick command recipes; this section provides the full context — directory layouts, restore point numbering, and day-by-day examples.
+These walkthroughs show what [vmbackup](https://github.com/doutsis/vmbackup) produces on disk for each rotation policy and how to list, understand, and restore from those backups. Section 9 gives quick command recipes; this section provides the full context — directory layouts, restore point numbering, and day-by-day examples.
 
 ### 10.1 Weekly Rotation Policy
 
@@ -1102,37 +1049,36 @@ Restore Points: my-vm
   ── 2026-W10 ──
   Directory: /mnt/vm-backups/my-vm/2026-W10
   Type: incremental
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-06 22:00:01  FULL (base)
-  1                 2026-03-07 22:00:01  Incremental
-  2                 2026-03-08 22:00:01  Incremental
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-06 22:00:01  FULL (base)     vda
+  1               2026-03-07 22:00:01  Incremental     vda
+  2               2026-03-08 22:00:01  Incremental     vda
+  ──────────────────────────────────────────────────────────────────────
   Total: 3
 
   Archived Chains:
     chain-2026-03-04                 1.2G  incremental  [vda]
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-02 22:00:01  FULL (base)     ← Monday
-  1                 2026-03-03 22:00:01  Incremental     ← Tuesday
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-02 22:00:01  FULL (base)     vda          ← Monday
+  1               2026-03-03 22:00:01  Incremental     vda          ← Tuesday
+  ──────────────────────────────────────────────────────────────────────
   Total: 2
 
     chain-2026-03-05                  800M  copy  [vda]
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-04 22:00:01  COPY (offline)
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-04 22:00:01  COPY (offline)  vda          ← Wednesday
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 
     chain-2026-03-06                  810M  copy  [vda]
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-05 22:00:01  COPY (offline)
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-05 22:00:01  COPY (offline)  vda          ← Thursday
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1176,13 +1122,12 @@ Restore Points: chain-2026-03-04
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/2026-W10/.archives/chain-2026-03-04
   Type: incremental
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-02 22:00:01  FULL (base)     ← Monday
-  1                 2026-03-03 22:00:01  Incremental     ← Tuesday
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-02 22:00:01  FULL (base)     vda          ← Monday
+  1               2026-03-03 22:00:01  Incremental     vda          ← Tuesday
+  ──────────────────────────────────────────────────────────────────────
   Total: 2
 ```
 
@@ -1211,12 +1156,11 @@ Restore Points: chain-2026-03-05
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/2026-W10/.archives/chain-2026-03-05
   Type: copy
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-04 22:00:01  COPY (offline)  ← Wednesday
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-04 22:00:01  COPY (offline)  vda          ← Wednesday
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1249,12 +1193,11 @@ Restore Points: chain-2026-03-13
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/2026-W11/.archives/chain-2026-03-13
   Type: copy
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-12 22:00:01  COPY (offline)  ← Thursday
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-12 22:00:01  COPY (offline)  vda          ← Thursday
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1376,12 +1319,11 @@ Restore Points: my-vm
   ── 20260303 ──
   Directory: /mnt/vm-backups/my-vm/20260303
   Type: full
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-03 22:00:01  FULL (only)
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-03 22:00:01  FULL (only)     vda
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1537,16 +1479,15 @@ Restore Points: chain-2026-03-06
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/202603/.archives/chain-2026-03-06
   Type: incremental
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-01 22:00:01  FULL (base)     ← Mar 1
-  1                 2026-03-02 22:00:01  Incremental     ← Mar 2
-  2                 2026-03-03 22:00:01  Incremental     ← Mar 3
-  3                 2026-03-04 22:00:01  Incremental     ← Mar 4
-  4                 2026-03-05 22:00:01  Incremental     ← Mar 5
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-01 22:00:01  FULL (base)     vda          ← Mar 1
+  1               2026-03-02 22:00:01  Incremental     vda          ← Mar 2
+  2               2026-03-03 22:00:01  Incremental     vda          ← Mar 3
+  3               2026-03-04 22:00:01  Incremental     vda          ← Mar 4
+  4               2026-03-05 22:00:01  Incremental     vda          ← Mar 5
+  ──────────────────────────────────────────────────────────────────────
   Total: 5
 ```
 
@@ -1573,12 +1514,11 @@ Restore Points: chain-2026-03-07
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/202603/.archives/chain-2026-03-07
   Type: copy
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-06 22:00:01  COPY (offline)  ← Mar 6
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-06 22:00:01  COPY (offline)  vda          ← Mar 6
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1694,16 +1634,15 @@ Restore Points: chain-2026-03-06
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/.archives/chain-2026-03-06
   Type: incremental
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-01 22:00:01  FULL (base)     ← Day 1
-  1                 2026-03-02 22:00:01  Incremental     ← Day 2
-  2                 2026-03-03 22:00:01  Incremental     ← Day 3
-  3                 2026-03-04 22:00:01  Incremental     ← Day 4
-  4                 2026-03-05 22:00:01  Incremental     ← Day 5
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-01 22:00:01  FULL (base)     vda          ← Day 1
+  1               2026-03-02 22:00:01  Incremental     vda          ← Day 2
+  2               2026-03-03 22:00:01  Incremental     vda          ← Day 3
+  3               2026-03-04 22:00:01  Incremental     vda          ← Day 4
+  4               2026-03-05 22:00:01  Incremental     vda          ← Day 5
+  ──────────────────────────────────────────────────────────────────────
   Total: 5
 ```
 
@@ -1730,12 +1669,11 @@ Restore Points: chain-2026-03-07
   ── (archive) ──
   Directory: /mnt/vm-backups/my-vm/.archives/chain-2026-03-07
   Type: copy
-  Disks: vda
 
-  Restore Point   Date                 Type
-  ──────────────────────────────────────────────────────────
-  0                 2026-03-06 22:00:01  COPY (offline)  ← Day 6
-  ──────────────────────────────────────────────────────────
+  Restore Point   Date                 Type            Disk(s)
+  ──────────────────────────────────────────────────────────────────────
+  0               2026-03-06 22:00:01  COPY (offline)  vda          ← Day 6
+  ──────────────────────────────────────────────────────────────────────
   Total: 1
 ```
 
@@ -1779,7 +1717,7 @@ If vmbackup runs more than once on the same day, the second run adds another inc
 ---
 ## 11. TPM and BitLocker Restore
 
-vmrestore automatically restores TPM state for VMs that have TPM backups (indicated by a `.tpm-backup-marker` file created by vmbackup.sh). No manual steps are needed.
+vmrestore automatically restores TPM state for VMs that have TPM backups (indicated by a `.tpm-backup-marker` file created by [vmbackup](https://github.com/doutsis/vmbackup)). No manual steps are needed.
 
 ### How It Works
 
@@ -1847,59 +1785,7 @@ ls /usr/share/OVMF/OVMF_CODE_4M.ms.fd
 ```
 
 ---
-## 13. Single File Restore (virtnbdmap)
-
-For recovering individual files without a full VM restore, use `virtnbdmap` directly:
-
-```bash
-# Load NBD kernel module
-sudo modprobe nbd max_partitions=15
-
-# Map backup to block device (specify data files in chronological order)
-sudo virtnbdmap -f vda.full.data,vda.inc.virtnbdbackup.1.data,vda.inc.virtnbdbackup.2.data
-
-# Identify partitions
-sudo fdisk -l /dev/nbd0
-
-# Mount partition (read-only to prevent modifications)
-sudo mount -o ro /dev/nbd0p2 /mnt/restore-temp      # Linux (ext4, xfs)
-sudo mount -o ro,norecovery -t ntfs3 /dev/nbd0p3 /mnt/restore-temp  # Windows (NTFS)
-
-# Copy needed files
-cp /mnt/restore-temp/path/to/file /tmp/recovered-file
-
-# Cleanup
-sudo umount /mnt/restore-temp
-# Press Ctrl+C in the virtnbdmap terminal
-```
-
-> **Warning:** Data files must be specified in correct chronological order. Wrong order produces a corrupted image.
-
-> **Note:** vmrestore.sh does not orchestrate virtnbdmap. This is a manual, low-level recovery tool from the virtnbdbackup package.
-
----
-## 14. Instant Boot from Backup
-
-Test a backup by booting it directly without performing a full restore:
-
-```bash
-# Map backup
-sudo virtnbdmap -f /mnt/backups/vm/my-vm/2026-W09/*.data
-
-# Create a copy-on-write overlay (all writes go to overlay, backup untouched)
-sudo qemu-img create -f qcow2 -b /dev/nbd0 -F raw /tmp/overlay.qcow2
-
-# Boot with QEMU
-sudo qemu-system-x86_64 -enable-kvm -m 4096 -drive file=/tmp/overlay.qcow2
-
-# Cleanup: kill QEMU, then Ctrl+C virtnbdmap, then rm overlay
-sudo rm /tmp/overlay.qcow2
-```
-
-> **Warning:** This is an advanced, manual procedure. The overlay approach means the backup is not modified, but the VM runs in degraded mode (no virtiofs, no SPICE, no defined network). Useful primarily for verifying that the backup boots.
-
----
-## 15. Verifying Backups Before Restore
+## 13. Verifying Backups Before Restore
 
 ### Checksum Verification
 
@@ -1922,7 +1808,7 @@ sudo vmrestore --dump my-vm --period 2026-W09
 Outputs JSON metadata including virtual disk size, data size, checkpoint names, dates, and compression details. Useful for confirming what's in a backup before restoring.
 
 ---
-## 16. Post-Restore Steps
+## 14. Post-Restore Steps
 
 ### Automated by vmrestore
 
@@ -1953,15 +1839,17 @@ Or open virt-manager and check the console.
 
 #### 2. Clean Stale Checkpoint Metadata
 
-The restored VM inherits checkpoint metadata from the backup. These checkpoints don't match the restored disk state and **will cause the next vmbackup run to fail** with "bitmap already exists" errors. Always clean them immediately after restore:
+The restored VM inherits checkpoint metadata from the backup. These checkpoints don't match the restored disk state.
+
+By default, vmbackup handles this automatically — its `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` setting (default: `yes`) archives the old chain and starts a fresh FULL on the next backup run. No manual cleanup is needed.
+
+If auto-recovery has been disabled (`warn`), you must clean the stale checkpoints manually or the next backup will fail with "bitmap already exists" errors:
 
 ```bash
 for cp in $(sudo virsh checkpoint-list {vm-name} --name 2>/dev/null); do
   sudo virsh checkpoint-delete {vm-name} --checkpointname "$cp" --metadata
 done
 ```
-
-This only removes metadata — it does not affect the restored disk data. vmbackup's next run will create a fresh full backup and start a new chain.
 
 #### 3. Re-Add CD-ROM Drives
 
@@ -1996,135 +1884,7 @@ sudo virsh edit {vm-name}
 ```
 
 ---
-
-## 17. Storage Cleanup with `--prune` (vmbackup)
-
-> `--prune` is a vmbackup command, not vmrestore. It is documented here because backup cleanup is part of the operational lifecycle — you restore, verify, then clean up old data you no longer need.
-
-As backups accumulate over weeks and months, archived chains consume significant storage. Automated retention handles count-based cleanup after each backup run, but sometimes you need to free space on your own terms — before enabling replication, after decommissioning a VM, or just to reclaim disk.
-
-`--prune` gives you targeted, operator-initiated deletion at granularities that automated retention doesn't offer.
-
-### The Workflow
-
-Every prune operation follows the same three-step pattern:
-
-```
-1. List    →  see what's using space
-2. Dry-run →  preview what would be removed
-3. Execute →  remove it (with confirmation prompt)
-```
-
-### Scenario: "I need to free space before enabling replication"
-
-Your replication destination has 400 GiB free but your backups total 530 GiB. Most of the space is archived chains you don't need for replication.
-
-```bash
-# Step 1: See the breakdown
-sudo vmbackup --prune list
-```
-
-The output shows per-VM totals with archive sizes. You spot one VM with 257 GiB in archives alone.
-
-```bash
-# Step 2: Drill into one VM
-sudo vmbackup --prune list --vm my-vm
-```
-
-This shows every period, every archived chain with its size, and copy-paste prune commands.
-
-```bash
-# Step 3: Preview removing all archives for that VM
-sudo vmbackup --prune archives --vm my-vm --dry-run
-```
-
-The dry run shows exactly what would be deleted and how much space would be freed — without touching anything.
-
-```bash
-# Step 4: Do it
-sudo vmbackup --prune archives --vm my-vm --yes
-```
-
-Active backup chains are untouched. The VM is still fully restorable from its current chain. Only the old archived chains are removed.
-
-### Scenario: "I decommissioned a VM and want to remove all its backup data"
-
-```bash
-# See what exists
-sudo vmbackup --prune list --vm old-vm
-
-# Preview the nuclear option
-sudo vmbackup --prune all --vm old-vm --dry-run
-
-# Remove everything — all periods, all archives, the entire VM directory
-sudo vmbackup --prune all --vm old-vm --yes
-```
-
-`all` overrides the keep-last guard that normally prevents you from removing the last period.
-
-### Scenario: "I want to remove one specific old archive chain"
-
-You had a chain break last week that created an 8 GiB archive. You've verified your current chain is healthy and want to reclaim the space.
-
-```bash
-# Find the chain name
-sudo vmbackup --prune list --vm my-vm
-
-# Preview
-sudo vmbackup --prune chain:chain-2026-01-14 --vm my-vm --dry-run
-
-# Remove just that one chain
-sudo vmbackup --prune chain:chain-2026-01-14 --vm my-vm --yes
-```
-
-### Scenario: "I want to clean up an old period but keep the current one"
-
-Your VM has periods from February and March. February is no longer needed.
-
-```bash
-# Preview
-sudo vmbackup --prune period:202602 --vm web-server --dry-run
-
-# Remove the entire February period (active chain + archives)
-sudo vmbackup --prune period:202602 --vm web-server --yes
-```
-
-The keep-last guard prevents you from accidentally deleting the last remaining period. If March is the only period left, a `--prune period:202603` will be blocked.
-
-### Scenario: "I want to remove all archives across every VM at once"
-
-Useful when archives are consuming the majority of storage and you only care about the current backup chains.
-
-```bash
-# Preview across all VMs
-sudo vmbackup --prune archives --dry-run
-
-# Remove all archived chains for all VMs
-sudo vmbackup --prune archives --yes
-```
-
-This walks every VM, every period, and removes `.archives/` directories. Active chains are never touched.
-
-### Target Reference
-
-| Target | What it removes | `--vm` required? |
-|--------|----------------|:---:|
-| `list` | Nothing — read-only discovery view | No |
-| `archives` | All archived chains across all periods | No (all VMs) or Yes (one VM) |
-| `archives:<period>` | Archived chains in one specific period | Yes |
-| `chain:<name>` | One specific archived chain | Yes |
-| `period:<period_id>` | Entire period directory (active + archives) | Yes |
-| `all` | Everything for a VM (all periods, entire directory) | Yes |
-
-### Safety
-
-- **Dry-run** (`--dry-run`) — preview without changes. Always available.
-- **Confirmation prompt** — interactive Y/N before any destructive operation. Bypass with `--yes` for scripting.
-- **Keep-last guard** — `period:` refuses to delete the last remaining period. Use `all` to explicitly remove everything.
-- **Audit trail** — every operation is logged to `vmprune.log` and recorded in the SQLite database (`chain_events`, `period_events`, `retention_events`, `file_operations`).
-
----
-## 18. Troubleshooting
+## 15. Troubleshooting
 
 ### Disk Collision Protection — "BLOCKED" Errors
 
@@ -2203,7 +1963,7 @@ sudo rm -f /var/tmp/virtnbdbackup.*
 
 ### "Bitmap already exists" on First Backup After Restore
 
-Clean stale checkpoint metadata (see [section 16 Cleaning Stale Checkpoints](#2-clean-stale-checkpoint-metadata)).
+This means vmbackup's `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` has been set to `warn`. Clean stale checkpoint metadata (see [section 14 step 2](#2-clean-stale-checkpoint-metadata)) or re-enable auto-recovery (the default).
 
 ### Restored VM Won't Boot (UEFI/TPM)
 
@@ -2222,17 +1982,6 @@ Expected behaviour. See [section 16 Re-Adding CD-ROM Drives](#3-re-add-cd-rom-dr
 This is **expected** when TPM state was not restored or when NVRAM differs. Enter the recovery key from `tpm-state/bitlocker-recovery-keys.txt` in the backup. BitLocker will re-seal on next reboot.
 
 If this happens on a **DR restore** (same UUID), check that TPM state was restored correctly (see [section 11](#11-tpm-and-bitlocker-restore)).
-
-### Restore is Extremely Slow
-
-```bash
-# Check storage performance
-dd if=/dev/zero of=/tmp/testfile bs=1M count=1024 oflag=direct
-# Should be >100 MB/s for reasonable restore times
-
-# Avoid restoring over network mounts — copy backup locally first
-# Ensure restore target is on fast storage (SSD/NVMe preferred)
-```
 
 ### Incremental File Missing from Chain
 
@@ -2259,7 +2008,7 @@ sudo vmrestore --vm my-vm --restore-path /tmp/test --dry-run
 ```
 
 ---
-## 19. Quick Reference Commands
+## 16. Quick Reference Commands
 
 ### Inventory & Inspection
 
@@ -2351,22 +2100,6 @@ sudo vmrestore --vm my-vm --restore-path /tmp/restore --dry-run
 sudo vmrestore --host-config
 ```
 
-### Single-File Recovery (virtnbdmap — Manual)
-
-```bash
-# Map backup to block device
-sudo modprobe nbd max_partitions=15
-sudo virtnbdmap -f <full.data>[,<inc.1.data>,<inc.2.data>]
-
-# Mount partition
-sudo mount -o ro /dev/nbd0p2 /mnt/restore-temp       # Linux
-sudo mount -o ro,norecovery -t ntfs3 /dev/nbd0p3 /mnt/restore-temp  # Windows
-
-# Cleanup
-sudo umount /mnt/restore-temp
-# Ctrl+C virtnbdmap
-```
-
 ### Post-Restore
 
 ```bash
@@ -2377,7 +2110,8 @@ sudo virsh start {vm-name}
 sudo virsh domblklist {vm-name}
 sudo virsh domdisplay {vm-name}
 
-# Clean stale checkpoints
+# Clean stale checkpoints (only needed if vmbackup auto-recovery is disabled)
+# By default, vmbackup handles this automatically on the next backup run
 for cp in $(sudo virsh checkpoint-list {vm-name} --name 2>/dev/null); do
   sudo virsh checkpoint-delete {vm-name} --checkpointname "$cp" --metadata
 done
@@ -2385,13 +2119,7 @@ done
 
 ---
 
-## 20. Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for the full version history.
-
----
-
-*vmrestore.sh v0.5.1 — Part of the vmbackup ecosystem*
+*vmrestore v0.5.2 — Part of the [vmbackup](https://github.com/doutsis/vmbackup) ecosystem*
 
 <p align="center">
   <img src="docs/vibe-coded.png" alt="Vibe Coded" />

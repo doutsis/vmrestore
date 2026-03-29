@@ -68,8 +68,8 @@
 #
 #   1. Resolve backup path, detect layout, find latest period/chain
 #   2. Pre-flight: disk collision, free space, running VM checks
-#   3. Disk-restore mode: if --disk set on multi-disk VM, branch to
-#      in-place replacement or staging extract (no VM define, no TPM)
+#   3. Disk-restore mode: if --disk set, branch to in-place replacement
+#      or staging extract (no VM define, no TPM)
 #   4. Run virtnbdrestore (DR: -c -D, clone: -c with staging dir)
 #   5. DR: re-inject original UUID and MACs
 #      Clone: strip UUID/MACs, rename disks, define with new identity
@@ -89,7 +89,7 @@
 
 set -uo pipefail
 
-readonly VERSION="0.5.1"
+readonly VERSION="0.5.2"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -449,9 +449,16 @@ list_vms() {
         size=$(du -sh "$vm_dir" 2>/dev/null | awk '{print $1}')
         [[ -f "$data_dir/.tpm-backup-marker" ]] && tpm_tag=" [TPM]"
 
-        # Show disk tags only for multi-disk VMs
-        local disks
-        disks=$(enumerate_disks "$data_dir")
+        # Show disk tags only for multi-disk VMs (latest CP's disks, not union)
+        local disks _latest_cp
+        _latest_cp=$(find "$data_dir/checkpoints" -name "virtnbdbackup.*.xml" 2>/dev/null \
+            | sed -n 's/.*virtnbdbackup\.\([0-9]*\)\.xml/\1/p' \
+            | sort -n | tail -1)
+        if [[ -n "$_latest_cp" ]]; then
+            disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_latest_cp")
+        else
+            disks=$(enumerate_disks "$data_dir")
+        fi
         [[ "$disks" == *,* ]] && disk_tag=" [$disks]"
 
         # Count archives across all period dirs
@@ -562,13 +569,101 @@ enumerate_disks() {
     printf '%s\n' "${!seen[@]}" | sort | paste -sd, | sed 's/,/, /g'
 }
 
+# Return sorted, comma-separated list of disks at a specific checkpoint number.
+# Parses .data filenames: {dev}.full.data (CP 0), {dev}.inc.virtnbdbackup.{N}.data,
+# {dev}.copy.data (CP 0). Used by: --list-restore-points, PIT staging trigger, --disk validation.
+enumerate_disks_at_checkpoint() {
+    local data_dir="$1" cp_num="$2"
+    local -A seen=()
+    local f fname dev
+    while IFS= read -r -d '' f; do
+        fname=$(basename "$f")
+        dev=""
+        case "$fname" in
+            *.full.data)
+                [[ "$cp_num" == "0" ]] && dev="${fname%.full.data}" ;;
+            *.inc.virtnbdbackup."${cp_num}".data)
+                dev="${fname%%.*}" ;;
+            *.copy.data)
+                [[ "$cp_num" == "0" ]] && dev="${fname%.copy.data}" ;;
+        esac
+        [[ -n "$dev" ]] && seen[$dev]=1
+    done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+    printf '%s\n' "${!seen[@]}" | sort | paste -sd, | sed 's/,/, /g'
+}
+
+# ── PIT Staging Directory ────────────────────────────────────────────────────
+# When a point-in-time restore targets a checkpoint whose disk set differs from
+# the latest checkpoint, virtnbdrestore picks the wrong vmconfig (always latest).
+# create_pit_staging() builds a temp directory with:
+#   - Symlinks to all .data files and checkpoints/ dir from the backup
+#   - A copy of the target checkpoint's vmconfig (the ONLY vmconfig present)
+# virtnbdrestore's lib.getLatest() then finds only the correct config.
+#
+# Returns: the staging directory path via stdout.
+# Caller must call cleanup_pit_staging() when done.
+
+create_pit_staging() {
+    local data_dir="$1" target_cp="$2"
+    local staging=""
+
+    # Prefer TMPDIR, fall back to a subdir of the backup parent
+    if [[ -d "${TMPDIR:-/tmp}" && -w "${TMPDIR:-/tmp}" ]]; then
+        staging=$(mktemp -d "${TMPDIR:-/tmp}/vmrestore-pit-XXXXXX")
+    else
+        staging=$(mktemp -d "$(dirname "$data_dir")/.vmrestore-pit-XXXXXX")
+    fi
+
+    # Symlink .data files
+    local f
+    while IFS= read -r -d '' f; do
+        ln -s "$f" "$staging/$(basename "$f")"
+    done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+
+    # Symlink checkpoints directory
+    [[ -d "$data_dir/checkpoints" ]] && ln -s "$data_dir/checkpoints" "$staging/checkpoints"
+
+    # Copy the target checkpoint's vmconfig — the ONLY vmconfig in staging
+    local target_vmconfig="$data_dir/vmconfig.virtnbdbackup.${target_cp}.xml"
+    if [[ -f "$target_vmconfig" ]]; then
+        cp "$target_vmconfig" "$staging/"
+    else
+        # Fallback: find vmconfig by checkpoint number from config/ dir.
+        # Config files sorted oldest-first by name = checkpoint order (0, 1, 2, ...).
+        local _fallback="" _cfg_dir=""
+        for _search in "$data_dir/config" "$(dirname "$data_dir")/config"; do
+            [[ -d "$_search" ]] && _cfg_dir="$_search" && break
+        done
+        if [[ -n "$_cfg_dir" ]]; then
+            _fallback=$(ls -1 "$_cfg_dir"/*.xml 2>/dev/null | sort | sed -n "$((target_cp + 1))p")
+        fi
+        if [[ -n "$_fallback" && -f "$_fallback" ]]; then
+            cp "$_fallback" "$staging/vmconfig.virtnbdbackup.${target_cp}.xml"
+            log_warn "create_pit_staging" "vmconfig.virtnbdbackup.${target_cp}.xml not found; using fallback: $(basename "$_fallback")"
+        else
+            log_error "create_pit_staging" "No vmconfig found for checkpoint $target_cp"
+            rm -rf "$staging"
+            return 1
+        fi
+    fi
+
+    echo "$staging"
+}
+
+cleanup_pit_staging() {
+    local staging_dir="${1:-}"
+    if [[ -n "$staging_dir" && -d "$staging_dir" && "$staging_dir" == *vmrestore-pit-* ]]; then
+        rm -rf "$staging_dir"
+    fi
+}
+
 show_restore_points() {
     local data_dir="$1"
     local btype
     btype=$(detect_backup_type "$data_dir")
 
-    echo "  Restore Point   Date                 Type"
-    echo "  ──────────────────────────────────────────────────────────"
+    echo "  Restore Point   Date                 Type            Disk(s)"
+    echo "  ──────────────────────────────────────────────────────────────────────"
 
     local count=0
     case "$btype" in
@@ -576,38 +671,41 @@ show_restore_points() {
             if [[ -d "$data_dir/checkpoints" ]]; then
                 while IFS= read -r -d '' f; do
                     [[ -f "$f" ]] || continue
-                    local name num ftime ptype
+                    local name num ftime ptype disks
                     name=$(basename "$f" .xml)
                     num="${name##*.}"
                     ftime=$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1)
                     ptype="Incremental"
                     [[ "$num" == "0" ]] && ptype="FULL (base)"
-                    printf "  %-15s   %s  %s\n" "$num" "$ftime" "$ptype"
+                    disks=$(enumerate_disks_at_checkpoint "$data_dir" "$num")
+                    printf "  %-15s   %-19s  %-15s %s\n" "$num" "$ftime" "$ptype" "$disks"
                     ((count++))
                 done < <(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -print0 2>/dev/null | sort -zV)
             fi
             ;;
         full)
-            local ff
+            local ff disks
             ff=$(find "$data_dir" -maxdepth 1 -name "*.full.data" 2>/dev/null | head -1)
             if [[ -n "$ff" ]]; then
-                printf "  %-15s   %s  FULL (only)\n" "0" \
-                    "$(stat -c '%y' "$ff" 2>/dev/null | cut -d. -f1)"
+                disks=$(enumerate_disks_at_checkpoint "$data_dir" "0")
+                printf "  %-15s   %-19s  %-15s %s\n" "0" \
+                    "$(stat -c '%y' "$ff" 2>/dev/null | cut -d. -f1)" "FULL (only)" "$disks"
                 count=1
             fi
             ;;
         copy)
-            local cf
+            local cf disks
             cf=$(find "$data_dir" -maxdepth 1 -name "*.copy.data" 2>/dev/null | head -1)
             if [[ -n "$cf" ]]; then
-                printf "  %-15s   %s  COPY (offline)\n" "0" \
-                    "$(stat -c '%y' "$cf" 2>/dev/null | cut -d. -f1)"
+                disks=$(enumerate_disks_at_checkpoint "$data_dir" "0")
+                printf "  %-15s   %-19s  %-15s %s\n" "0" \
+                    "$(stat -c '%y' "$cf" 2>/dev/null | cut -d. -f1)" "COPY (offline)" "$disks"
                 count=1
             fi
             ;;
     esac
 
-    echo "  ──────────────────────────────────────────────────────────"
+    echo "  ──────────────────────────────────────────────────────────────────────"
     echo "  Total: $count"
     echo ""
 }
@@ -809,7 +907,7 @@ define_new_identity() {
 #                           (clone: restore-path/clone-name.qcow2)
 #                           (non-clone: restore-path/original-basename.qcow2)
 predict_output_files() {
-    local data_dir="$1" restore_path="$2" use_c="$3" disk_filter="${4:-}" clone_name="${5:-}"
+    local data_dir="$1" restore_path="$2" use_c="$3" disk_filter="${4:-}" clone_name="${5:-}" cfg_override="${6:-}"
     _PREDICTED_FILES=()
     _PREDICTED_BASENAMES=()
     _PREDICTED_DEVICE_MAP=()
@@ -818,11 +916,16 @@ predict_output_files() {
     if [[ "$use_c" == true ]]; then
         # With -c: output = basename of original <source file=...> from config XML
         local cfg_xml=""
-        for search_dir in "$data_dir/config" "$(dirname "$data_dir")/config"; do
-            [[ -d "$search_dir" ]] || continue
-            cfg_xml=$(ls -1t "$search_dir"/*.xml 2>/dev/null | head -1 || true)
-            [[ -n "$cfg_xml" ]] && break
-        done
+        if [[ -n "$cfg_override" && -f "$cfg_override" ]]; then
+            # Fix 5: Use the target checkpoint's vmconfig for PIT restores
+            cfg_xml="$cfg_override"
+        else
+            for search_dir in "$data_dir/config" "$(dirname "$data_dir")/config"; do
+                [[ -d "$search_dir" ]] || continue
+                cfg_xml=$(ls -1t "$search_dir"/*.xml 2>/dev/null | head -1 || true)
+                [[ -n "$cfg_xml" ]] && break
+            done
+        fi
         if [[ -z "$cfg_xml" || ! -f "$cfg_xml" ]]; then
             log_warn "predict_output_files" "No config XML found — cannot predict output filenames"
             return 1
@@ -1093,9 +1196,9 @@ restore_vm() {
     log_info "restore_vm" "Data dir: $data_dir (type: $btype)"
 
     # ── Disk-Restore Mode ────────────────────────────────────────────────────
-    # When --disk is specified and the backup has multiple disks, this is a
-    # disk-level file replacement — not a VM restore. No VM definition changes,
-    # no TPM, no UUID/MAC changes. The VM already exists.
+    # When --disk is specified, this is a disk-level file replacement — not a
+    # VM restore. No VM definition changes, no TPM, no UUID/MAC changes. The
+    # VM already exists. Works for single-disk and multi-disk VMs alike.
     # Supports: --disk vda | --disk vda,vdb | --disk all
     if [[ -n "${OPT_DISK:-}" ]]; then
         local available_disks
@@ -1126,7 +1229,7 @@ restore_vm() {
             die "No disk names specified" "restore_vm"
         fi
 
-        # Validate all disk names against available disks
+        # Validate all disk names against available disks (union across all CPs)
         for _d in "${disk_list[@]}"; do
             local _found=false
             local IFS=', '
@@ -1139,352 +1242,422 @@ restore_vm() {
             fi
         done
 
-        # Count available disks — if single-disk VM, fall through to normal restore
-        local avail_disk_count=0
-        local IFS=', '
-        for _d in $available_disks; do
-            ((avail_disk_count++))
-        done
-        unset IFS
-        if [[ "$avail_disk_count" -eq 1 ]]; then
-            log_info "restore_vm" "VM has only one disk — proceeding as normal restore"
-            # Fall through to standard restore flow below
-        else
-            # Multi-disk VM — enter disk-restore mode
-            local disk_list_display
-            disk_list_display=$(printf '%s, ' "${disk_list[@]}")
-            disk_list_display="${disk_list_display%, }"
-            log_info "restore_vm" "Disk restore mode: replacing '$disk_list_display' (available: $available_disks)"
-
-            # ── Common pre-checks (once) ─────────────────────────────────
-            local _inplace=false
-            if [[ -z "$OPT_RESTORE_PATH" ]]; then
-                _inplace=true
-                if ! virsh dominfo "$vm_name" &>/dev/null; then
-                    die "VM '$vm_name' is not defined in libvirt — cannot determine original disk paths. Use --restore-path to extract disks to a specific location instead." "restore_vm"
-                fi
-                local vm_state
-                vm_state=$(virsh domstate "$vm_name" 2>/dev/null | tr -d '[:space:]')
-                if [[ "$vm_state" != "shutoff" ]]; then
-                    die "VM '$vm_name' is $vm_state — shut it down first (virsh shutdown $vm_name). Replacing disks under a running VM will cause corruption." "restore_vm"
-                fi
-                log_info "restore_vm" "VM '$vm_name' is shut off ✓"
+        # Point-in-time disk availability: validate each disk exists at the target checkpoint
+        if [[ "$btype" == "incremental" ]]; then
+            local _target_cp=""
+            if [[ "$OPT_RESTORE_POINT" != "latest" ]]; then
+                case "$OPT_RESTORE_POINT" in
+                    full)   _target_cp="0" ;;
+                    [0-9]*) _target_cp="$OPT_RESTORE_POINT" ;;
+                esac
             else
-                log_info "restore_vm" "Extract mode: writing to $OPT_RESTORE_PATH"
+                # Latest = highest checkpoint number
+                _target_cp=$(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -printf '%f\n' 2>/dev/null \
+                    | sed 's/virtnbdbackup\.\([0-9]*\)\.xml/\1/' | sort -n | tail -1)
             fi
-
-            # ── Per-disk resolution ──────────────────────────────────────
-            # Build associative arrays: disk → original path, target dir, target file
-            local -A _dk_path=()   # disk → original file path (in-place only)
-            local -A _dk_dir=()    # disk → restore target directory
-            local -A _dk_file=()   # disk → original filename (in-place only)
-            local total_data_bytes=0
-            local total_prerestore_bytes=0
-
-            local _vm_xml=""
-            if [[ "$_inplace" == true ]]; then
-                _vm_xml=$(virsh dumpxml --inactive "$vm_name" 2>/dev/null)
-            fi
-
-            for _d in "${disk_list[@]}"; do
-                if [[ "$_inplace" == true ]]; then
-                    local _opath
-                    _opath=$(echo "$_vm_xml" | grep -B5 "target dev='$_d'" | \
-                        grep -oP "source file='\K[^']+" | head -1 || true)
-                    if [[ -z "$_opath" ]]; then
-                        die "Disk '$_d' not found in VM '$vm_name' configuration. Available disks: $(virsh domblklist "$vm_name" --details 2>/dev/null | awk '$2=="disk"{print $3}' | paste -sd', ')" "restore_vm"
-                    fi
-                    if [[ ! -f "$_opath" ]]; then
-                        die "Original disk path does not exist: $_opath — Use --restore-path to extract disks to a specific location instead." "restore_vm"
-                    fi
-                    # Check for .pre-restore overwrite
-                    if [[ -f "${_opath}.pre-restore" && "$OPT_NO_PRE_RESTORE" == false ]]; then
-                        die "Pre-restore file already exists: ${_opath}.pre-restore — delete it first or use --no-pre-restore" "restore_vm"
-                    fi
-                    _dk_path[$_d]="$_opath"
-                    _dk_dir[$_d]=$(dirname "$_opath")
-                    _dk_file[$_d]=$(basename "$_opath")
-                    log_info "restore_vm" "  $_d → $_opath"
-                    # Accumulate .pre-restore space
-                    if [[ "$OPT_NO_PRE_RESTORE" == false ]]; then
-                        total_prerestore_bytes=$(( total_prerestore_bytes + $(stat -c%s "$_opath" 2>/dev/null || echo 0) ))
-                    fi
-                else
-                    _dk_dir[$_d]="$OPT_RESTORE_PATH"
-                fi
-
-                # Accumulate backup data size for this disk
-                while IFS= read -r -d '' _dfile; do
-                    local _dfname _ddev=""
-                    _dfname=$(basename "$_dfile")
-                    case "$_dfname" in
-                        *.full.data)                _ddev="${_dfname%.full.data}" ;;
-                        *.inc.virtnbdbackup.*.data) _ddev="${_dfname%%.*}" ;;
-                        *.copy.data)                _ddev="${_dfname%.copy.data}" ;;
-                    esac
-                    [[ "$_ddev" == "$_d" ]] && total_data_bytes=$(( total_data_bytes + $(stat -c%s "$_dfile" 2>/dev/null || echo 0) ))
-                done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
-            done
-
-            # ── Single space check for all disks ────────────────────────
-            local total_needed=$(( total_data_bytes + total_prerestore_bytes ))
-            local avail_bytes
-            local _space_check_dir
-            if [[ "$_inplace" == true ]]; then
-                _space_check_dir="${_dk_dir[${disk_list[0]}]}"
-            else
-                _space_check_dir="$OPT_RESTORE_PATH"
-            fi
-            while [[ -n "$_space_check_dir" && ! -d "$_space_check_dir" ]]; do
-                _space_check_dir=$(dirname "$_space_check_dir")
-            done
-            avail_bytes=$(df --output=avail -B1 "$_space_check_dir" 2>/dev/null | tail -1 | tr -d '[:space:]')
-            avail_bytes="${avail_bytes:-0}"
-            if (( total_needed > avail_bytes )); then
-                local need_hr avail_hr
-                need_hr=$(numfmt --to=iec-i --suffix=B "$total_needed" 2>/dev/null || echo "$total_needed bytes")
-                avail_hr=$(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null || echo "$avail_bytes bytes")
-                die "Insufficient space: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm"
-            fi
-            local data_hr
-            data_hr=$(numfmt --to=iec-i --suffix=B "$total_data_bytes" 2>/dev/null || echo "$total_data_bytes bytes")
-            if [[ "$_inplace" == true && "$OPT_NO_PRE_RESTORE" == false && "$total_prerestore_bytes" -gt 0 ]]; then
-                local prerestore_hr
-                prerestore_hr=$(numfmt --to=iec-i --suffix=B "$total_prerestore_bytes" 2>/dev/null || echo "$total_prerestore_bytes bytes")
-                log_info "restore_vm" "Space check: ${data_hr} restore + ${prerestore_hr} .pre-restore — $(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null) available ✓"
-            else
-                log_info "restore_vm" "Space check: ${data_hr} restore — $(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null) available ✓"
-            fi
-
-            # ── Dry run ──────────────────────────────────────────────────
-            if [[ "$OPT_DRY_RUN" == true ]]; then
+            if [[ -n "$_target_cp" ]]; then
+                local _cp_disks
+                _cp_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_target_cp")
                 for _d in "${disk_list[@]}"; do
-                    log_info "restore_vm" "[DRY RUN] Disk restore: $_d"
-                    if [[ -n "${_dk_path[$_d]:-}" ]]; then
-                        log_info "restore_vm" "[DRY RUN] Would rename: ${_dk_path[$_d]} → ${_dk_path[$_d]}.pre-restore"
-                        log_info "restore_vm" "[DRY RUN] Would restore to: ${_dk_path[$_d]}"
-                    else
-                        log_info "restore_vm" "[DRY RUN] Would restore to: $OPT_RESTORE_PATH/"
+                    local _cp_found=false
+                    local IFS=', '
+                    for _cp_avail in $_cp_disks; do
+                        [[ "$_cp_avail" == "$_d" ]] && _cp_found=true
+                    done
+                    unset IFS
+                    if [[ "$_cp_found" == false ]]; then
+                        # Find the last checkpoint where this disk existed
+                        local _last_seen=""
+                        local _cp_n
+                        for _cp_n in $(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -printf '%f\n' 2>/dev/null \
+                            | sed 's/virtnbdbackup\.\([0-9]*\)\.xml/\1/' | sort -rn); do
+                            local _check_disks
+                            _check_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_cp_n")
+                            if [[ ", $_check_disks, " == *", $_d, "* ]]; then
+                                _last_seen="$_cp_n"
+                                break
+                            fi
+                        done
+                        if [[ -n "$_last_seen" ]]; then
+                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks). It was last backed up at checkpoint $_last_seen. Use --restore-point $_last_seen to restore this disk." "restore_vm"
+                        else
+                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks)." "restore_vm"
+                        fi
                     fi
-                    log_info "restore_vm" "[DRY RUN] virtnbdrestore -i $data_dir -o ${_dk_dir[$_d]} -d $_d"
                 done
-                if [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" == "incremental" ]]; then
-                    local until_cp_dr
-                    case "$OPT_RESTORE_POINT" in
-                        full)    until_cp_dr="virtnbdbackup.0" ;;
-                        [0-9]*)  until_cp_dr="virtnbdbackup.$OPT_RESTORE_POINT" ;;
-                    esac
-                    log_info "restore_vm" "[DRY RUN] Point-in-time: --until $until_cp_dr"
+            fi
+        fi
+
+        local disk_list_display
+        disk_list_display=$(printf '%s, ' "${disk_list[@]}")
+        disk_list_display="${disk_list_display%, }"
+        log_info "restore_vm" "Disk restore mode: replacing '$disk_list_display' (available: $available_disks)"
+
+        # ── Common pre-checks (once) ─────────────────────────────────
+        local _inplace=false
+        if [[ -z "$OPT_RESTORE_PATH" ]]; then
+            _inplace=true
+            if ! virsh dominfo "$vm_name" &>/dev/null; then
+                die "VM '$vm_name' is not defined in libvirt — cannot determine original disk paths. Use --restore-path to extract disks to a specific location instead." "restore_vm"
+            fi
+            local vm_state
+            vm_state=$(virsh domstate "$vm_name" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$vm_state" != "shutoff" ]]; then
+                die "VM '$vm_name' is $vm_state — shut it down first (virsh shutdown $vm_name). Replacing disks under a running VM will cause corruption." "restore_vm"
+            fi
+            log_info "restore_vm" "VM '$vm_name' is shut off ✓"
+        else
+            log_info "restore_vm" "Extract mode: writing to $OPT_RESTORE_PATH"
+        fi
+
+        # ── Per-disk resolution ──────────────────────────────────────
+        # Build associative arrays: disk → original path, target dir, target file
+        local -A _dk_path=()   # disk → original file path (in-place only)
+        local -A _dk_dir=()    # disk → restore target directory
+        local -A _dk_file=()   # disk → original filename (in-place only)
+        local total_data_bytes=0
+        local total_prerestore_bytes=0
+
+        local _vm_xml=""
+        if [[ "$_inplace" == true ]]; then
+            _vm_xml=$(virsh dumpxml --inactive "$vm_name" 2>/dev/null)
+        fi
+
+        for _d in "${disk_list[@]}"; do
+            if [[ "$_inplace" == true ]]; then
+                local _opath
+                _opath=$(echo "$_vm_xml" | grep -B5 "target dev='$_d'" | \
+                    grep -oP "source file='\K[^']+" | head -1 || true)
+                if [[ -z "$_opath" ]]; then
+                    die "Disk '$_d' not found in VM '$vm_name' configuration. Available disks: $(virsh domblklist "$vm_name" --details 2>/dev/null | awk '$2=="disk"{print $3}' | paste -sd', ')" "restore_vm"
                 fi
-                log_info "restore_vm" "Disk restore complete: $vm_name/$disk_list_display [DRY RUN — no changes made]"
-                return 0
+                if [[ ! -f "$_opath" ]]; then
+                    die "Original disk path does not exist: $_opath — Use --restore-path to extract disks to a specific location instead." "restore_vm"
+                fi
+                # Check for .pre-restore overwrite
+                if [[ -f "${_opath}.pre-restore" && "$OPT_NO_PRE_RESTORE" == false ]]; then
+                    die "Pre-restore file already exists: ${_opath}.pre-restore — delete it first or use --no-pre-restore" "restore_vm"
+                fi
+                _dk_path[$_d]="$_opath"
+                _dk_dir[$_d]=$(dirname "$_opath")
+                _dk_file[$_d]=$(basename "$_opath")
+                log_info "restore_vm" "  $_d → $_opath"
+                # Accumulate .pre-restore space
+                if [[ "$OPT_NO_PRE_RESTORE" == false ]]; then
+                    total_prerestore_bytes=$(( total_prerestore_bytes + $(stat -c%s "$_opath" 2>/dev/null || echo 0) ))
+                fi
+            else
+                _dk_dir[$_d]="$OPT_RESTORE_PATH"
             fi
 
-            # ── Restore loop ─────────────────────────────────────────────
-            mkdir -p "${OPT_RESTORE_PATH:-${_dk_dir[${disk_list[0]}]}}"
+            # Accumulate backup data size for this disk
+            while IFS= read -r -d '' _dfile; do
+                local _dfname _ddev=""
+                _dfname=$(basename "$_dfile")
+                case "$_dfname" in
+                    *.full.data)                _ddev="${_dfname%.full.data}" ;;
+                    *.inc.virtnbdbackup.*.data) _ddev="${_dfname%%.*}" ;;
+                    *.copy.data)                _ddev="${_dfname%.copy.data}" ;;
+                esac
+                [[ "$_ddev" == "$_d" ]] && total_data_bytes=$(( total_data_bytes + $(stat -c%s "$_dfile" 2>/dev/null || echo 0) ))
+            done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+        done
 
-            local -a _restored_disks=()
-            local -a _prerestore_files=()
-            local _failed_disk=""
-            local _disk_idx=0
-            local _disk_total=${#disk_list[@]}
+        # ── Single space check for all disks ────────────────────────
+        local total_needed=$(( total_data_bytes + total_prerestore_bytes ))
+        local avail_bytes
+        local _space_check_dir
+        if [[ "$_inplace" == true ]]; then
+            _space_check_dir="${_dk_dir[${disk_list[0]}]}"
+        else
+            _space_check_dir="$OPT_RESTORE_PATH"
+        fi
+        while [[ -n "$_space_check_dir" && ! -d "$_space_check_dir" ]]; do
+            _space_check_dir=$(dirname "$_space_check_dir")
+        done
+        avail_bytes=$(df --output=avail -B1 "$_space_check_dir" 2>/dev/null | tail -1 | tr -d '[:space:]')
+        avail_bytes="${avail_bytes:-0}"
+        if (( total_needed > avail_bytes )); then
+            local need_hr avail_hr
+            need_hr=$(numfmt --to=iec-i --suffix=B "$total_needed" 2>/dev/null || echo "$total_needed bytes")
+            avail_hr=$(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null || echo "$avail_bytes bytes")
+            die "Insufficient space: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm"
+        fi
+        local data_hr
+        data_hr=$(numfmt --to=iec-i --suffix=B "$total_data_bytes" 2>/dev/null || echo "$total_data_bytes bytes")
+        if [[ "$_inplace" == true && "$OPT_NO_PRE_RESTORE" == false && "$total_prerestore_bytes" -gt 0 ]]; then
+            local prerestore_hr
+            prerestore_hr=$(numfmt --to=iec-i --suffix=B "$total_prerestore_bytes" 2>/dev/null || echo "$total_prerestore_bytes bytes")
+            log_info "restore_vm" "Space check: ${data_hr} restore + ${prerestore_hr} .pre-restore — $(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null) available ✓"
+        else
+            log_info "restore_vm" "Space check: ${data_hr} restore — $(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null) available ✓"
+        fi
 
+        # ── PIT staging (disk-restore mode) ──────────────────────────
+        # When point-in-time targets a checkpoint with a different disk set,
+        # create a staging input directory so virtnbdrestore reads the correct vmconfig.
+        local pit_input_dir=""
+        if [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" == "incremental" ]]; then
+            local _pit_target_cp=""
+            case "$OPT_RESTORE_POINT" in
+                full)   _pit_target_cp="0" ;;
+                [0-9]*) _pit_target_cp="$OPT_RESTORE_POINT" ;;
+            esac
+            if [[ -n "$_pit_target_cp" ]]; then
+                local _pit_latest_cp
+                _pit_latest_cp=$(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -printf '%f\n' 2>/dev/null \
+                    | sed 's/virtnbdbackup\.\([0-9]*\)\.xml/\1/' | sort -n | tail -1)
+                local _pit_target_disks _pit_latest_disks
+                _pit_target_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_pit_target_cp")
+                _pit_latest_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_pit_latest_cp")
+                if [[ "$_pit_target_disks" != "$_pit_latest_disks" ]]; then
+                    log_warn "restore_vm" "Disk configuration changed between checkpoint $_pit_target_cp and latest ($_pit_latest_cp)."
+                    log_warn "restore_vm" "  Checkpoint $_pit_target_cp: $_pit_target_disks"
+                    log_warn "restore_vm" "  Latest (CP $_pit_latest_cp): $_pit_latest_disks"
+                    log_warn "restore_vm" "  Restoring with checkpoint $_pit_target_cp disk configuration."
+                    if [[ "$OPT_DRY_RUN" == false ]]; then
+                        pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
+                            die "Failed to create PIT staging directory" "restore_vm"
+                        log_info "restore_vm" "PIT staging directory: $pit_input_dir"
+                    fi
+                fi
+            fi
+        fi
+        local _virtnbd_data_dir="${pit_input_dir:-$data_dir}"
+
+        # ── Dry run ──────────────────────────────────────────────────
+        if [[ "$OPT_DRY_RUN" == true ]]; then
             for _d in "${disk_list[@]}"; do
-                ((_disk_idx++))
-                log_info "restore_vm" "── Restoring $_d [$_disk_idx/$_disk_total] ──"
+                log_info "restore_vm" "[DRY RUN] Disk restore: $_d"
+                if [[ -n "${_dk_path[$_d]:-}" ]]; then
+                    log_info "restore_vm" "[DRY RUN] Would rename: ${_dk_path[$_d]} → ${_dk_path[$_d]}.pre-restore"
+                    log_info "restore_vm" "[DRY RUN] Would restore to: ${_dk_path[$_d]}"
+                else
+                    log_info "restore_vm" "[DRY RUN] Would restore to: $OPT_RESTORE_PATH/"
+                fi
+                log_info "restore_vm" "[DRY RUN] virtnbdrestore -i $_virtnbd_data_dir -o ${_dk_dir[$_d]} -d $_d"
+            done
+            if [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" == "incremental" ]]; then
+                local until_cp_dr
+                case "$OPT_RESTORE_POINT" in
+                    full)    until_cp_dr="virtnbdbackup.0" ;;
+                    [0-9]*)  until_cp_dr="virtnbdbackup.$OPT_RESTORE_POINT" ;;
+                esac
+                log_info "restore_vm" "[DRY RUN] Point-in-time: --until $until_cp_dr"
+            fi
+            if [[ -n "$pit_input_dir" ]]; then
+                log_info "restore_vm" "[DRY RUN] PIT staging: would create staging dir with checkpoint $OPT_RESTORE_POINT vmconfig"
+            fi
+            log_info "restore_vm" "Disk restore complete: $vm_name/$disk_list_display [DRY RUN — no changes made]"
+            return 0
+        fi
 
-                local _tgt_dir="${_dk_dir[$_d]}"
-                local _orig="${_dk_path[$_d]:-}"
+        # ── Restore loop ─────────────────────────────────────────────
+        mkdir -p "${OPT_RESTORE_PATH:-${_dk_dir[${disk_list[0]}]}}"
 
-                # Create .pre-restore backup
-                if [[ -n "$_orig" && -f "$_orig" && "$OPT_NO_PRE_RESTORE" == false ]]; then
-                    mv "$_orig" "${_orig}.pre-restore"
-                    _prerestore_files+=("${_orig}.pre-restore")
-                    log_info "restore_vm" "Backed up existing: ${_orig}.pre-restore"
-                elif [[ -n "$_orig" && "$OPT_NO_PRE_RESTORE" == true ]]; then
-                    rm -f "$_orig"
-                    log_warn "restore_vm" "Removed existing disk (--no-pre-restore): $_orig"
+        local -a _restored_disks=()
+        local -a _prerestore_files=()
+        local _failed_disk=""
+        local _disk_idx=0
+        local _disk_total=${#disk_list[@]}
+
+        for _d in "${disk_list[@]}"; do
+            ((_disk_idx++))
+            log_info "restore_vm" "── Restoring $_d [$_disk_idx/$_disk_total] ──"
+
+            local _tgt_dir="${_dk_dir[$_d]}"
+            local _orig="${_dk_path[$_d]:-}"
+
+            # Create .pre-restore backup
+            if [[ -n "$_orig" && -f "$_orig" && "$OPT_NO_PRE_RESTORE" == false ]]; then
+                mv "$_orig" "${_orig}.pre-restore"
+                _prerestore_files+=("${_orig}.pre-restore")
+                log_info "restore_vm" "Backed up existing: ${_orig}.pre-restore"
+            elif [[ -n "$_orig" && "$OPT_NO_PRE_RESTORE" == true ]]; then
+                rm -f "$_orig"
+                log_warn "restore_vm" "Removed existing disk (--no-pre-restore): $_orig"
+            fi
+
+            # Build virtnbdrestore command
+            local -a disk_cmd=(virtnbdrestore -i "$_virtnbd_data_dir" -o "$_tgt_dir" -d "$_d")
+
+            # Point-in-time
+            if [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" == "incremental" ]]; then
+                local until_cp=""
+                case "$OPT_RESTORE_POINT" in
+                    full)    until_cp="virtnbdbackup.0" ;;
+                    [0-9]*)  until_cp="virtnbdbackup.$OPT_RESTORE_POINT" ;;
+                    *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" ;;
+                esac
+                disk_cmd+=(--until "$until_cp")
+                [[ $_disk_idx -eq 1 ]] && log_info "restore_vm" "Point-in-time: $until_cp"
+            elif [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" != "incremental" ]]; then
+                [[ $_disk_idx -eq 1 ]] && log_warn "restore_vm" "Point-in-time ignored (backup type: $btype)"
+            fi
+
+            log_info "restore_vm" "Executing: ${disk_cmd[*]}"
+            if ! run_logged "${disk_cmd[@]}"; then
+                # Restore failed — rollback this disk's .pre-restore
+                if [[ -n "$_orig" && -f "${_orig}.pre-restore" ]]; then
+                    mv "${_orig}.pre-restore" "$_orig"
+                    # Remove from prerestore_files list
+                    local -a _tmp_pr=()
+                    for _pf in "${_prerestore_files[@]}"; do
+                        [[ "$_pf" != "${_orig}.pre-restore" ]] && _tmp_pr+=("$_pf")
+                    done
+                    _prerestore_files=("${_tmp_pr[@]}")
+                    log_warn "restore_vm" "Restored original from .pre-restore after failure"
+                fi
+                _failed_disk="$_d"
+                break
+            fi
+
+            # Clean up vmconfig.xml dropped by virtnbdrestore
+            rm -f "$_tgt_dir/vmconfig.xml"
+
+            # In-place post-processing
+            if [[ -n "$_orig" ]]; then
+                # Find restored file — virtnbdrestore uses original filename
+                if [[ -f "$_orig" ]]; then
+                    true  # already at correct path
+                else
+                    local _restored_file="$_tgt_dir/${_d}.qcow2"
+                    if [[ -f "$_restored_file" ]]; then
+                        mv "$_restored_file" "$_orig"
+                        log_info "restore_vm" "Renamed: ${_d}.qcow2 → ${_dk_file[$_d]}"
+                    else
+                        log_warn "restore_vm" "Expected restored file not found at $_orig or $_restored_file"
+                    fi
                 fi
 
-                # Build virtnbdrestore command
-                local -a disk_cmd=(virtnbdrestore -i "$data_dir" -o "$_tgt_dir" -d "$_d")
+                # Ownership and permissions
+                chown libvirt-qemu:libvirt-qemu "$_orig" 2>/dev/null || \
+                    log_warn "restore_vm" "Failed to set ownership on $_orig"
+                chmod 600 "$_orig" 2>/dev/null || true
 
-                # Point-in-time
-                if [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" == "incremental" ]]; then
-                    local until_cp=""
-                    case "$OPT_RESTORE_POINT" in
-                        full)    until_cp="virtnbdbackup.0" ;;
-                        [0-9]*)  until_cp="virtnbdbackup.$OPT_RESTORE_POINT" ;;
-                        *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" ;;
-                    esac
-                    disk_cmd+=(--until "$until_cp")
-                    [[ $_disk_idx -eq 1 ]] && log_info "restore_vm" "Point-in-time: $until_cp"
-                elif [[ "$OPT_RESTORE_POINT" != "latest" && "$btype" != "incremental" ]]; then
-                    [[ $_disk_idx -eq 1 ]] && log_warn "restore_vm" "Point-in-time ignored (backup type: $btype)"
-                fi
-
-                log_info "restore_vm" "Executing: ${disk_cmd[*]}"
-                if ! run_logged "${disk_cmd[@]}"; then
-                    # Restore failed — rollback this disk's .pre-restore
-                    if [[ -n "$_orig" && -f "${_orig}.pre-restore" ]]; then
-                        mv "${_orig}.pre-restore" "$_orig"
-                        # Remove from prerestore_files list
-                        local -a _tmp_pr=()
-                        for _pf in "${_prerestore_files[@]}"; do
-                            [[ "$_pf" != "${_orig}.pre-restore" ]] && _tmp_pr+=("$_pf")
-                        done
-                        _prerestore_files=("${_tmp_pr[@]}")
-                        log_warn "restore_vm" "Restored original from .pre-restore after failure"
+                # Integrity check
+                if qemu-img check "$_orig" &>/dev/null; then
+                    log_info "restore_vm" "  $_d: ownership ✓ integrity ✓"
+                else
+                    log_error "restore_vm" "INTEGRITY CHECK FAILED: $_orig"
+                    if [[ -f "${_orig}.pre-restore" ]]; then
+                        log_error "restore_vm" "Roll back: mv ${_orig}.pre-restore $_orig"
                     fi
                     _failed_disk="$_d"
                     break
                 fi
-
-                # Clean up vmconfig.xml dropped by virtnbdrestore
-                rm -f "$_tgt_dir/vmconfig.xml"
-
-                # In-place post-processing
-                if [[ -n "$_orig" ]]; then
-                    # Find restored file — virtnbdrestore uses original filename
-                    if [[ -f "$_orig" ]]; then
-                        true  # already at correct path
-                    else
-                        local _restored_file="$_tgt_dir/${_d}.qcow2"
-                        if [[ -f "$_restored_file" ]]; then
-                            mv "$_restored_file" "$_orig"
-                            log_info "restore_vm" "Renamed: ${_d}.qcow2 → ${_dk_file[$_d]}"
-                        else
-                            log_warn "restore_vm" "Expected restored file not found at $_orig or $_restored_file"
-                        fi
-                    fi
-
-                    # Ownership and permissions
-                    chown libvirt-qemu:libvirt-qemu "$_orig" 2>/dev/null || \
-                        log_warn "restore_vm" "Failed to set ownership on $_orig"
-                    chmod 600 "$_orig" 2>/dev/null || true
-
-                    # Integrity check
-                    if qemu-img check "$_orig" &>/dev/null; then
-                        log_info "restore_vm" "  $_d: ownership ✓ integrity ✓"
-                    else
-                        log_error "restore_vm" "INTEGRITY CHECK FAILED: $_orig"
-                        if [[ -f "${_orig}.pre-restore" ]]; then
-                            log_error "restore_vm" "Roll back: mv ${_orig}.pre-restore $_orig"
-                        fi
-                        _failed_disk="$_d"
-                        break
-                    fi
-                else
-                    # Staging: integrity check on extracted file
-                    local _stage_file
-                    _stage_file=$(find "$_tgt_dir" -maxdepth 1 -name "*.qcow2" -newer "$data_dir" 2>/dev/null | head -1)
-                    if [[ -n "$_stage_file" ]]; then
-                        ls -lh "$_stage_file" 2>/dev/null | while IFS= read -r line; do
-                            log_info "restore_vm" "  $line"
-                        done
-                        if qemu-img check "$_stage_file" &>/dev/null; then
-                            log_info "restore_vm" "  $_d: integrity ✓"
-                        else
-                            log_error "restore_vm" "INTEGRITY CHECK FAILED: $_stage_file"
-                        fi
-                    fi
-                fi
-                _restored_disks+=("$_d")
-            done
-
-            # ── Post-loop: summary, warnings, cleanup notice ─────────────
-
-            # Storage pool refresh (once)
-            if [[ "$_inplace" == true ]]; then
-                refresh_storage_pool "${_dk_dir[${disk_list[0]}]}"
-            fi
-
-            # Handle failure with partial completion
-            if [[ -n "$_failed_disk" ]]; then
-                if [[ ${#_restored_disks[@]} -gt 0 ]]; then
-                    local _restored_display
-                    _restored_display=$(printf '%s, ' "${_restored_disks[@]}")
-                    _restored_display="${_restored_display%, }"
-                    log_error "restore_vm" "Partial restore: $_restored_display succeeded, $_failed_disk FAILED"
-                    # List remaining skipped disks
-                    local _in_skipped=false
-                    for _d in "${disk_list[@]}"; do
-                        [[ "$_d" == "$_failed_disk" ]] && _in_skipped=true && continue
-                        [[ "$_in_skipped" == true ]] && log_error "restore_vm" "Skipped: $_d"
-                    done
-                fi
-                die "Disk restore failed for $_failed_disk" "restore_vm"
-            fi
-
-            # Checkpoint invalidation warning (once)
-            if [[ "$_inplace" == true ]]; then
-                echo ""
-                log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
-                log_warn "restore_vm" "CHECKPOINT CHAIN INVALIDATED for '$vm_name'"
-                log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
-                log_warn "restore_vm" "Replaced disk(s) no longer match existing QEMU checkpoint bitmaps."
-                log_warn "restore_vm" ""
-                log_warn "restore_vm" "If vmbackup ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=\"yes\":"
-                log_warn "restore_vm" "  → Next backup will auto-archive old chain and start a fresh FULL."
-                log_warn "restore_vm" ""
-                log_warn "restore_vm" "If \"warn\" (default):"
-                log_warn "restore_vm" "  → Next backup will FAIL until checkpoints are manually cleaned."
-                log_warn "restore_vm" "  → To clean: for cp in \$(virsh checkpoint-list $vm_name --name 2>/dev/null); do"
-                log_warn "restore_vm" "       virsh checkpoint-delete $vm_name \$cp --metadata; done"
-                log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
-            fi
-
-            # .pre-restore cleanup notice (once, all files)
-            if [[ ${#_prerestore_files[@]} -gt 0 ]]; then
-                echo ""
-                log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
-                log_warn "restore_vm" "ACTION REQUIRED: Remove .pre-restore file(s) once VM is confirmed working"
-                local _total_pr_size=0
-                for _pf in "${_prerestore_files[@]}"; do
-                    local _pf_size _pf_size_hr
-                    _pf_size=$(stat -c%s "$_pf" 2>/dev/null || echo 0)
-                    _pf_size_hr=$(du -sh "$_pf" 2>/dev/null | awk '{print $1}')
-                    log_warn "restore_vm" "  rm $_pf  ($_pf_size_hr)"
-                    _total_pr_size=$(( _total_pr_size + _pf_size ))
-                done
-                if [[ ${#_prerestore_files[@]} -gt 1 ]]; then
-                    local _total_pr_hr
-                    _total_pr_hr=$(numfmt --to=iec-i --suffix=B "$_total_pr_size" 2>/dev/null || echo "$_total_pr_size bytes")
-                    log_warn "restore_vm" "  Total: $_total_pr_hr"
-                fi
-                log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
-            fi
-
-            # Disk size comparisons
-            if [[ "$_inplace" == true ]]; then
-                for _d in "${_restored_disks[@]}"; do
-                    local _orig="${_dk_path[$_d]:-}"
-                    if [[ -n "$_orig" && -f "${_orig}.pre-restore" ]]; then
-                        local old_vsize new_vsize
-                        old_vsize=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('virtual-size',0))" < <(qemu-img info --output=json "${_orig}.pre-restore" 2>/dev/null) 2>/dev/null || echo 0)
-                        new_vsize=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('virtual-size',0))" < <(qemu-img info --output=json "$_orig" 2>/dev/null) 2>/dev/null || echo 0)
-                        if [[ "$old_vsize" -gt 0 && "$new_vsize" -gt 0 && "$old_vsize" != "$new_vsize" ]]; then
-                            local old_hr new_hr
-                            old_hr=$(numfmt --to=iec-i --suffix=B "$old_vsize" 2>/dev/null || echo "$old_vsize")
-                            new_hr=$(numfmt --to=iec-i --suffix=B "$new_vsize" 2>/dev/null || echo "$new_vsize")
-                            log_warn "restore_vm" "Disk $_d capacity changed: $old_hr → $new_hr (disk was resized since backup)"
-                        fi
-                    fi
-                done
-            fi
-
-            # Final summary
-            local _restored_display
-            _restored_display=$(printf '%s, ' "${_restored_disks[@]}")
-            _restored_display="${_restored_display%, }"
-            if [[ "$_inplace" == true ]]; then
-                log_info "restore_vm" "Disk restore complete: $vm_name/$_restored_display — all ✓"
             else
-                log_info "restore_vm" "Disk extract complete: $vm_name/$_restored_display → $OPT_RESTORE_PATH"
+                # Staging: integrity check on extracted file
+                local _stage_file
+                _stage_file=$(find "$_tgt_dir" -maxdepth 1 -name "*.qcow2" -newer "$data_dir" 2>/dev/null | head -1)
+                if [[ -n "$_stage_file" ]]; then
+                    ls -lh "$_stage_file" 2>/dev/null | while IFS= read -r line; do
+                        log_info "restore_vm" "  $line"
+                    done
+                    if qemu-img check "$_stage_file" &>/dev/null; then
+                        log_info "restore_vm" "  $_d: integrity ✓"
+                    else
+                        log_error "restore_vm" "INTEGRITY CHECK FAILED: $_stage_file"
+                    fi
+                fi
             fi
+            _restored_disks+=("$_d")
+        done
 
-            return 0
+        # ── Post-loop: summary, warnings, cleanup notice ─────────────
+
+        # Storage pool refresh (once)
+        if [[ "$_inplace" == true ]]; then
+            refresh_storage_pool "${_dk_dir[${disk_list[0]}]}"
         fi
+
+        # Handle failure with partial completion
+        if [[ -n "$_failed_disk" ]]; then
+            if [[ ${#_restored_disks[@]} -gt 0 ]]; then
+                local _restored_display
+                _restored_display=$(printf '%s, ' "${_restored_disks[@]}")
+                _restored_display="${_restored_display%, }"
+                log_error "restore_vm" "Partial restore: $_restored_display succeeded, $_failed_disk FAILED"
+                # List remaining skipped disks
+                local _in_skipped=false
+                for _d in "${disk_list[@]}"; do
+                    [[ "$_d" == "$_failed_disk" ]] && _in_skipped=true && continue
+                    [[ "$_in_skipped" == true ]] && log_error "restore_vm" "Skipped: $_d"
+                done
+            fi
+            cleanup_pit_staging "$pit_input_dir"
+            die "Disk restore failed for $_failed_disk" "restore_vm"
+        fi
+
+        # Checkpoint invalidation warning (once)
+        if [[ "$_inplace" == true ]]; then
+            echo ""
+            log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
+            log_warn "restore_vm" "CHECKPOINT CHAIN INVALIDATED for '$vm_name'"
+            log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
+            log_warn "restore_vm" "Replaced disk(s) no longer match existing QEMU checkpoint bitmaps."
+            log_warn "restore_vm" ""
+            log_warn "restore_vm" "If vmbackup ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=\"yes\":"
+            log_warn "restore_vm" "  → Next backup will auto-archive old chain and start a fresh FULL."
+            log_warn "restore_vm" ""
+            log_warn "restore_vm" "If \"warn\" (default):"
+            log_warn "restore_vm" "  → Next backup will FAIL until checkpoints are manually cleaned."
+            log_warn "restore_vm" "  → To clean: for cp in \$(virsh checkpoint-list $vm_name --name 2>/dev/null); do"
+            log_warn "restore_vm" "       virsh checkpoint-delete $vm_name \$cp --metadata; done"
+            log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
+        fi
+
+        # .pre-restore cleanup notice (once, all files)
+        if [[ ${#_prerestore_files[@]} -gt 0 ]]; then
+            echo ""
+            log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
+            log_warn "restore_vm" "ACTION REQUIRED: Remove .pre-restore file(s) once VM is confirmed working"
+            local _total_pr_size=0
+            for _pf in "${_prerestore_files[@]}"; do
+                local _pf_size _pf_size_hr
+                _pf_size=$(stat -c%s "$_pf" 2>/dev/null || echo 0)
+                _pf_size_hr=$(du -sh "$_pf" 2>/dev/null | awk '{print $1}')
+                log_warn "restore_vm" "  rm $_pf  ($_pf_size_hr)"
+                _total_pr_size=$(( _total_pr_size + _pf_size ))
+            done
+            if [[ ${#_prerestore_files[@]} -gt 1 ]]; then
+                local _total_pr_hr
+                _total_pr_hr=$(numfmt --to=iec-i --suffix=B "$_total_pr_size" 2>/dev/null || echo "$_total_pr_size bytes")
+                log_warn "restore_vm" "  Total: $_total_pr_hr"
+            fi
+            log_warn "restore_vm" "═══════════════════════════════════════════════════════════"
+        fi
+
+        # Disk size comparisons
+        if [[ "$_inplace" == true ]]; then
+            for _d in "${_restored_disks[@]}"; do
+                local _orig="${_dk_path[$_d]:-}"
+                if [[ -n "$_orig" && -f "${_orig}.pre-restore" ]]; then
+                    local old_vsize new_vsize
+                    old_vsize=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('virtual-size',0))" < <(qemu-img info --output=json "${_orig}.pre-restore" 2>/dev/null) 2>/dev/null || echo 0)
+                    new_vsize=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('virtual-size',0))" < <(qemu-img info --output=json "$_orig" 2>/dev/null) 2>/dev/null || echo 0)
+                    if [[ "$old_vsize" -gt 0 && "$new_vsize" -gt 0 && "$old_vsize" != "$new_vsize" ]]; then
+                        local old_hr new_hr
+                        old_hr=$(numfmt --to=iec-i --suffix=B "$old_vsize" 2>/dev/null || echo "$old_vsize")
+                        new_hr=$(numfmt --to=iec-i --suffix=B "$new_vsize" 2>/dev/null || echo "$new_vsize")
+                        log_warn "restore_vm" "Disk $_d capacity changed: $old_hr → $new_hr (disk was resized since backup)"
+                    fi
+                fi
+            done
+        fi
+
+        # Final summary
+        local _restored_display
+        _restored_display=$(printf '%s, ' "${_restored_disks[@]}")
+        _restored_display="${_restored_display%, }"
+        if [[ "$_inplace" == true ]]; then
+            log_info "restore_vm" "Disk restore complete: $vm_name/$_restored_display — all ✓"
+        else
+            log_info "restore_vm" "Disk extract complete: $vm_name/$_restored_display → $OPT_RESTORE_PATH"
+        fi
+
+        cleanup_pit_staging "$pit_input_dir"
+        return 0
     fi
     # ── End Disk-Restore Mode ────────────────────────────────────────────────
 
@@ -1551,6 +1724,39 @@ restore_vm() {
         log_warn "restore_vm" "Point-in-time ignored (backup type: $btype)"
     fi
 
+    # ── PIT staging (DR/clone mode) ──────────────────────────────────────
+    # When point-in-time targets a checkpoint with a different disk set,
+    # create a staging input directory so virtnbdrestore reads the correct vmconfig.
+    local pit_input_dir=""
+    if [[ -n "$until_cp" && "$btype" == "incremental" ]]; then
+        local _pit_target_cp=""
+        case "$OPT_RESTORE_POINT" in
+            full)   _pit_target_cp="0" ;;
+            [0-9]*) _pit_target_cp="$OPT_RESTORE_POINT" ;;
+        esac
+        if [[ -n "$_pit_target_cp" ]]; then
+            local _pit_latest_cp
+            _pit_latest_cp=$(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -printf '%f\n' 2>/dev/null \
+                | sed 's/virtnbdbackup\.\([0-9]*\)\.xml/\1/' | sort -n | tail -1)
+            local _pit_target_disks _pit_latest_disks
+            _pit_target_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_pit_target_cp")
+            _pit_latest_disks=$(enumerate_disks_at_checkpoint "$data_dir" "$_pit_latest_cp")
+            if [[ "$_pit_target_disks" != "$_pit_latest_disks" ]]; then
+                log_warn "restore_vm" "Disk configuration changed between checkpoint $_pit_target_cp and latest ($_pit_latest_cp)."
+                log_warn "restore_vm" "  Checkpoint $_pit_target_cp: $_pit_target_disks"
+                log_warn "restore_vm" "  Latest (CP $_pit_latest_cp): $_pit_latest_disks"
+                log_warn "restore_vm" "  Restoring with checkpoint $_pit_target_cp disk configuration."
+                if [[ "$OPT_DRY_RUN" == false ]]; then
+                    pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
+                        die "Failed to create PIT staging directory" "restore_vm"
+                    log_info "restore_vm" "PIT staging directory: $pit_input_dir"
+                    # Replace -i in cmd array: element 0=virtnbdrestore, 1=-i, 2=data_dir
+                    cmd[2]="$pit_input_dir"
+                fi
+            fi
+        fi
+    fi
+
     # ── Pre-flight free space check ──
     preflight_free_space "$data_dir" "$OPT_RESTORE_PATH" "$btype" "$until_cp"
 
@@ -1559,7 +1765,26 @@ restore_vm() {
     local use_c_flag=false
     [[ "$OPT_SKIP_CONFIG" == false ]] && use_c_flag=true
     local _predicted_ok=true
-    if predict_output_files "$data_dir" "$OPT_RESTORE_PATH" "$use_c_flag" "${OPT_DISK:-}" "${OPT_NAME:-}"; then
+    # Fix 5: When PIT staging detected a disk config change, use the target CP's vmconfig
+    local _predict_cfg_override=""
+    if [[ -n "$pit_input_dir" ]]; then
+        # Real run: use vmconfig from the PIT staging dir
+        _predict_cfg_override=$(ls -1 "$pit_input_dir"/vmconfig.virtnbdbackup.*.xml 2>/dev/null | head -1)
+    elif [[ -n "${_pit_target_cp:-}" && "${_pit_target_disks:-}" != "${_pit_latest_disks:-}" ]]; then
+        # Dry run: use vmconfig from backup dir directly
+        _predict_cfg_override="$data_dir/vmconfig.virtnbdbackup.${_pit_target_cp}.xml"
+        if [[ ! -f "$_predict_cfg_override" ]]; then
+            # Fallback to config/ dir by ordinal
+            local _cfg_dir=""
+            for _search in "$data_dir/config" "$(dirname "$data_dir")/config"; do
+                [[ -d "$_search" ]] && _cfg_dir="$_search" && break
+            done
+            if [[ -n "$_cfg_dir" ]]; then
+                _predict_cfg_override=$(ls -1 "$_cfg_dir"/*.xml 2>/dev/null | sort | sed -n "$((_pit_target_cp + 1))p")
+            fi
+        fi
+    fi
+    if predict_output_files "$data_dir" "$OPT_RESTORE_PATH" "$use_c_flag" "${OPT_DISK:-}" "${OPT_NAME:-}" "$_predict_cfg_override"; then
         preflight_disk_safety "$vm_name" "$OPT_DRY_RUN" "$OPT_FORCE"
     else
         log_warn "restore_vm" "Could not predict output files — skipping disk safety checks"
@@ -1586,6 +1811,9 @@ restore_vm() {
 
     if [[ "$OPT_DRY_RUN" == true ]]; then
         log_info "restore_vm" "[DRY RUN] ${cmd[*]}"
+        if [[ -n "$pit_input_dir" || ( -n "$until_cp" && "$_pit_target_disks" != "${_pit_latest_disks:-}" ) ]]; then
+            log_info "restore_vm" "[DRY RUN] PIT staging: would create staging dir with checkpoint $OPT_RESTORE_POINT vmconfig"
+        fi
         if [[ "$new_identity" == true ]]; then
             log_info "restore_vm" "[DRY RUN] Would define '$OPT_NAME' with new UUID and MACs"
             log_info "restore_vm" "[DRY RUN] Staging dir: $staging_dir"
@@ -1603,8 +1831,9 @@ restore_vm() {
 
         # Provision vmconfig XML for archived chains that lack vmconfig.virtnbdbackup.*.xml
         # virtnbdrestore requires this file even without -c/-D flags
+        # Skip when PIT staging is active — staging dir already has the correct vmconfig
         local _provisioned_vmconfig=""
-        if ! ls "$data_dir"/vmconfig.virtnbdbackup.*.xml &>/dev/null; then
+        if [[ -z "$pit_input_dir" ]] && ! ls "$data_dir"/vmconfig.virtnbdbackup.*.xml &>/dev/null; then
             local _cfg_xml=""
             for _search_dir in "$data_dir/config" "$(dirname "$data_dir")/config"; do
                 [[ -d "$_search_dir" ]] || continue
@@ -1629,18 +1858,20 @@ restore_vm() {
         elif [[ "$OPT_SKIP_CONFIG" == false ]]; then
             # Primary failed — retry without -D (disk restore only)
             log_warn "restore_vm" "virtnbdrestore failed, retrying disk-only..."
-            local retry=(virtnbdrestore -i "$data_dir" -o "$virtnbd_output_path" -c -U "qemu:///system")
+            local retry=(virtnbdrestore -i "${pit_input_dir:-$data_dir}" -o "$virtnbd_output_path" -c -U "qemu:///system")
             [[ -n "${OPT_DISK:-}" ]] && retry+=(-d "$OPT_DISK")
             [[ -n "$until_cp" ]] && retry+=(--until "$until_cp")
             if run_logged "${retry[@]}"; then
                 restore_ok=true
             else
-                # Clean up staging dir on failure before dying
+                # Clean up staging dirs on failure before dying
                 [[ -n "$staging_dir" && -d "$staging_dir" ]] && rm -rf "$staging_dir"
+                cleanup_pit_staging "$pit_input_dir"
                 die "Disk restore failed" "restore_vm"
             fi
         else
             [[ -n "$staging_dir" && -d "$staging_dir" ]] && rm -rf "$staging_dir"
+            cleanup_pit_staging "$pit_input_dir"
             die "Disk restore failed" "restore_vm"
         fi
 
@@ -1657,6 +1888,9 @@ restore_vm() {
             rm -rf "$staging_dir"
             log_info "restore_vm" "Staging directory cleaned up"
         fi
+
+        # Clean up PIT staging directory (input symlinks + vmconfig copy)
+        cleanup_pit_staging "$pit_input_dir"
 
         # Define VM from config (when virtnbdrestore didn't -D, or new-identity)
         if [[ "$OPT_SKIP_CONFIG" == false && "$new_identity" == true ]]; then

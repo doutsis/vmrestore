@@ -11,17 +11,25 @@ It wraps [virtnbdrestore](https://github.com/abbbi/virtnbdbackup) to provide sin
 
 ## Why vmrestore
 
-[vmbackup](https://github.com/doutsis/vmbackup) captures everything needed to rebuild a VM — disk images, VM configuration, TPM state, NVRAM, BitLocker recovery keys and checksums. But restoring all of that involves more than just running virtnbdrestore. You need to reconstruct disk images, re-define the VM in libvirt with the correct UUID and MAC addresses, restore TPM state to the right path, isolate NVRAM for clones, check for disk collisions and refresh storage pools.
+[vmbackup](https://github.com/doutsis/vmbackup) captures everything needed to rebuild a VM — disk images, VM configuration, TPM state, NVRAM, BitLocker recovery keys and checksums. Backups are only as good as your ability to restore them, and restoring all of that correctly involves more than running virtnbdrestore. Disk images must be reconstructed across full and incremental chains. The VM must be re-defined in libvirt with the original UUID and MAC addresses intact. TPM state needs to land at the right path. NVRAM must be isolated for clones. Storage pools need refreshing. Disk collisions must be caught before anything is overwritten.
 
-vmrestore orchestrates the full restore lifecycle so you can go from "VM is gone" to "VM is running" in one command.
+vmrestore handles all of it. One command, every detail — so the moment you need a restore is not the moment you're learning how to do one.
+
+- **Disaster recovery** — rebuild a destroyed VM from any backup chain
+- **Clone restores** — stand up an isolated copy with a new name, no identity conflicts
+- **Point-in-time recovery** — roll back to any incremental checkpoint in the chain
+- **Single-disk restore** — surgical recovery of one disk without touching the rest
+- **Pre-flight safety** — dry-run mode, collision detection, disk integrity checks and detailed logging at every step
+
+vmbackup and vmrestore are tested together but coupled to nothing. vmrestore is a standalone script — no shared libraries, no daemons, no runtime dependencies on vmbackup. Install it on a recovery host that has never seen vmbackup and it works the same way.
 
 ## Quick Start
 
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmrestore/releases/download/v0.5.1/vmrestore_0.5.1_all.deb
-sudo dpkg -i vmrestore_0.5.1_all.deb
+wget https://github.com/doutsis/vmrestore/releases/download/v0.5.2/vmrestore_0.5.2_all.deb
+sudo dpkg -i vmrestore_0.5.2_all.deb
 ```
 
 **Any distro (from source):**
@@ -76,7 +84,6 @@ sudo vmrestore --vm my-vm --restore-path /var/lib/libvirt/images            # re
 | `virtnbdbackup` | ≥ 2.28 | Provides `virtnbdrestore` (disk restore engine) |
 | `libvirt-daemon-system` | — | `virsh` domain management |
 | `qemu-utils` | — | `qemu-img` for post-restore disk checks |
-| `bash` | ≥ 5.0 | Required for associative arrays |
 
 **vmrestore only works with backups created by [vmbackup](https://github.com/doutsis/vmbackup).** It reads vmbackup's configuration to resolve the backup path and depends on the specific on-disk structure, metadata files and naming conventions that vmbackup produces. vmrestore has no runtime coupling to vmbackup — no shared code, no sourced modules — but the two scripts are designed as complementary halves of one backup-and-restore system.
 
@@ -114,7 +121,7 @@ sudo vmrestore --list-restore-points my-vm
 sudo vmrestore --list-restore-points my-vm --period 2026-W09
 ```
 
-`--list` shows all VMs with their backup type, total size, restore point count (summed across all periods), archived chain count, and tags for TPM and multi-disk VMs. `--list-restore-points` shows every retention period with its restore points (numbered to match `--restore-point`), date, type (FULL, Incremental, COPY), available disks, and any archived chains — everything you need to decide what to restore and from when. No log files are created for read-only commands.
+`--list` shows all VMs with their backup type, total size, restore point count (summed across all periods), archived chain count, and tags for TPM and multi-disk VMs. `--list-restore-points` shows every retention period with its restore points (numbered to match `--restore-point`), date, type (FULL, Incremental, COPY), per-checkpoint disk set, and any archived chains — everything you need to decide what to restore and from when. No log files are created for read-only commands.
 
 ### Disaster Recovery (DR)
 
@@ -163,6 +170,8 @@ sudo vmrestore --vm my-vm --name test-clone \
 
 Something went wrong at 2pm but the backup from this morning was fine. Point-in-time lets you restore to a specific moment — a particular restore point, a specific backup period, or even an older archived chain. You pick exactly how far back to go.
 
+If disks were added or removed between checkpoints, vmrestore detects the configuration change and automatically restores the correct disk set for the target checkpoint — no manual intervention needed. Use `--list-restore-points` to see the per-checkpoint disk layout before restoring.
+
 Start with `--list-restore-points` to see what's available — it shows every period with numbered restore points, dates, and types, so you can identify exactly which point to restore to:
 
 ```bash
@@ -193,11 +202,11 @@ Point-in-time works with both DR and clone modes — add `--name` to clone from 
 
 One disk went bad but everything else is fine — the VM definition, the other disks, TPM, NVRAM. You don't need a full DR restore, you just need to swap out the broken disk. Disk restore replaces specific disk file(s) without touching anything else. The VM keeps its identity, its configuration, and its other disks exactly as they are.
 
-Use `--list-restore-points` to see which disks are in a backup — it shows a `Disks:` line listing all available device names:
+Use `--list-restore-points` to see which disks are available at each restore point — each row shows a `Disk(s)` column listing the device names backed up at that checkpoint:
 
 ```bash
 sudo vmrestore --list-restore-points my-vm
-# Output includes: Disks: sda, vda, vdb
+# Each restore point row includes: Disk(s) column (e.g. sda, vda, vdb)
 ```
 
 Pick the disk(s) you need to replace:
@@ -267,9 +276,9 @@ After every restore:
 sudo virsh start my-vm
 ```
 
-**Checkpoint cleanup:** Restoring disk(s) invalidates QEMU checkpoint bitmaps. If your vmbackup config has `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="yes"`, the next backup will automatically archive the old chain and start a fresh FULL — no manual action needed.
+**Checkpoint cleanup:** Restoring disk(s) invalidates QEMU checkpoint bitmaps. By default, vmbackup handles this automatically — its `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` setting (default: `yes`) archives the old chain and starts a fresh FULL on the next backup run. No manual cleanup is needed.
 
-Otherwise, clean stale checkpoints manually before the next backup:
+If auto-recovery has been disabled (`warn`), clean stale checkpoints manually before the next backup:
 
 ```bash
 for cp in $(sudo virsh checkpoint-list my-vm --name 2>/dev/null); do
@@ -277,19 +286,65 @@ for cp in $(sudo virsh checkpoint-list my-vm --name 2>/dev/null); do
 done
 ```
 
+## Installation
+
+### Uninstall
+
+**Debian / Ubuntu (.deb install):**
+
+```bash
+sudo apt remove vmrestore    # remove but keep logs
+sudo apt purge vmrestore     # remove everything including logs
+```
+
+**From source (make install):**
+
+```bash
+sudo make uninstall
+```
+
+Uninstall removes the script, PATH symlink and log directory. Backup data is never touched — it lives wherever you configured `BACKUP_PATH` in vmbackup.
+
+## Tested
+
+vmrestore is validated together with [vmbackup](https://github.com/doutsis/vmbackup) using a destructive end-to-end test that exercises the full backup-to-restore lifecycle across 6 VMs (Linux + Windows, single-disk + multi-disk, with and without TPM/BitLocker). The test is config-driven — VM definitions, paths and timeouts live in an external config file.
+
+The current test fleet:
+
+| VM | Disks | TPM | UEFI/NVRAM | Notes |
+|----|-------|-----|------------|-------|
+| Linux base | 1× VirtIO | No | No | Baseline Linux guest |
+| Linux multi-disk | 2× VirtIO + 1× SATA | No | No | Cloned from base, mixed bus disks added |
+| Linux multi-disk clone | 2× VirtIO + 1× SATA | No | No | Cloned from multi-disk |
+| Windows base | 1× VirtIO | Yes | Yes (OVMF) | BitLocker enabled, UEFI + Secure Boot |
+| Windows multi-disk | 2× VirtIO + 1× SATA | Yes | Yes (OVMF) | Cloned from base, mixed bus disks added |
+| Windows multi-disk clone | 2× VirtIO + 1× SATA | Yes | Yes (OVMF) | Cloned from multi-disk |
+
+What the test validates for vmrestore specifically:
+
+- **Backup integrity** — `vmrestore --verify` confirms backup data is restorable
+- **Clone restore** — restore representative VMs as clones with new UUID, verify preserved checkfile data and disk paths, then destroy clones
+- **Point-in-time restore** — restore to specific restore points across both active and archived backup chains (8 sub-tests across 2 VMs), verify each clone boots and the checkfile content matches the expected point in time
+- **Point-in-time with disk changes** — restore to checkpoints where the VM's disk configuration differs from the latest checkpoint (disks added or removed mid-chain). Validates per-checkpoint disk display, automatic staging directory creation, disk validation against the target checkpoint's disk set, correct clone file prediction, and single-disk restore of removed disks. Tested across both active and archived chains with disk-removal patterns (18 tests, 100% pass).
+- **Single-disk restore** — replace a single disk via `--disk` on a multi-disk VM, verify `.pre-restore` backup creation, disk integrity, VM boot, and `--no-pre-restore` mode
+- **DR restore** — destroy all 6 VMs (definitions, disks, NVRAM), restore all from backup to a clean path
+- **Post-restore verification** — for every restored VM: UUID and MAC addresses match originals, all disks present and intact (`qemu-img check`), TPM state directory preserved, checkfile survived the full backup → destroy → restore cycle, BitLocker not triggered on Windows VMs
+
 ## Documentation
 
-Full technical documentation is included in [vmrestore.md](vmrestore.md) (installed to `/opt/vmrestore/vmrestore.md`). It covers backup structure, rotation policies, restore scenarios, TPM/BitLocker/NVRAM handling, single-file recovery via virtnbdmap, troubleshooting and a quick reference command sheet.
+The full guide ships with vmrestore and is always available locally:
 
-## Known Issues
+```
+cat /opt/vmrestore/vmrestore.md
+```
 
-### `--disk` on single-disk VMs
+[vmrestore.md](vmrestore.md) covers:
 
-`vmrestore --disk` is designed for in-place disk replacement without touching the VM definition. However, on VMs with only one disk, vmrestore silently falls through to full-VM restore mode — which undefines the VM from libvirt. This is unexpected when the intent is to swap out a single disk file.
-
-**Workaround:** Use `--disk` only on multi-disk VMs. For single-disk VMs, use a standard DR restore instead.
-
-**Status:** Will be fixed in a future release. `--disk` on a single-disk VM should perform an in-place disk replacement, not a full-VM restore.
+- Backup structure and rotation policies
+- Restore scenarios — disaster recovery, clones, point-in-time, single-disk
+- TPM, BitLocker and NVRAM handling
+- Troubleshooting
+- Quick reference command sheet
 
 ## Issues
 
