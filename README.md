@@ -28,8 +28,8 @@ vmbackup and vmrestore are tested together but coupled to nothing. vmrestore is 
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmrestore/releases/download/v0.5.2/vmrestore_0.5.2_all.deb
-sudo dpkg -i vmrestore_0.5.2_all.deb
+wget https://github.com/doutsis/vmrestore/releases/download/v0.5.3/vmrestore_0.5.3_all.deb
+sudo dpkg -i vmrestore_0.5.3_all.deb
 ```
 
 **Any distro (from source):**
@@ -307,28 +307,42 @@ Uninstall removes the script, PATH symlink and log directory. Backup data is nev
 
 ## Tested
 
-vmrestore is validated together with [vmbackup](https://github.com/doutsis/vmbackup) using a destructive end-to-end test that exercises the full backup-to-restore lifecycle across 6 VMs (Linux + Windows, single-disk + multi-disk, with and without TPM/BitLocker). The test is config-driven — VM definitions, paths and timeouts live in an external config file.
+vmrestore and [vmbackup](https://github.com/doutsis/vmbackup) are tested end-to-end on a fleet of Linux and Windows VMs across multiple config instances. Tests are destructive — VMs are backed up, checkpointed, destroyed and restored from scratch — validating the full lifecycle from first backup to disaster recovery.
 
-The current test fleet:
+### Test Fleet
 
-| VM | Disks | TPM | UEFI/NVRAM | Notes |
-|----|-------|-----|------------|-------|
-| Linux base | 1× VirtIO | No | No | Baseline Linux guest |
-| Linux multi-disk | 2× VirtIO + 1× SATA | No | No | Cloned from base, mixed bus disks added |
-| Linux multi-disk clone | 2× VirtIO + 1× SATA | No | No | Cloned from multi-disk |
-| Windows base | 1× VirtIO | Yes | Yes (OVMF) | BitLocker enabled, UEFI + Secure Boot |
-| Windows multi-disk | 2× VirtIO + 1× SATA | Yes | Yes (OVMF) | Cloned from base, mixed bus disks added |
-| Windows multi-disk clone | 2× VirtIO + 1× SATA | Yes | Yes (OVMF) | Cloned from multi-disk |
+| VM | Instance | Disks | TPM | Boot |
+|----|----------|-------|-----|------|
+| Linux base | default | 1× VirtIO | No | BIOS |
+| Linux multi-disk | default | 2× VirtIO + 1× SATA | No | BIOS |
+| Linux multi-disk clone | default | 2× VirtIO + 1× SATA | No | BIOS |
+| Windows base | default | 1× VirtIO | Yes | UEFI |
+| Windows multi-disk | default | 2× VirtIO + 1× SATA | Yes | UEFI |
+| Windows multi-disk clone | default | 2× VirtIO + 1× SATA | Yes | UEFI |
+| Linux base | prod | 1× VirtIO | No | BIOS |
+| Linux multi-disk | prod | 2× VirtIO + 1× SATA | No | BIOS |
+| Windows base | prod | 1× VirtIO | Yes | UEFI |
+| Windows multi-disk | prod | 2× VirtIO + 1× SATA | Yes | UEFI |
 
-What the test validates for vmrestore specifically:
+The `default` and `prod` instances back up to isolated paths with separate VM filters, validating that multi-instance deployments stay fully isolated.
 
-- **Backup integrity** — `vmrestore --verify` confirms backup data is restorable
-- **Clone restore** — restore representative VMs as clones with new UUID, verify preserved checkfile data and disk paths, then destroy clones
-- **Point-in-time restore** — restore to specific restore points across both active and archived backup chains (8 sub-tests across 2 VMs), verify each clone boots and the checkfile content matches the expected point in time
-- **Point-in-time with disk changes** — restore to checkpoints where the VM's disk configuration differs from the latest checkpoint (disks added or removed mid-chain). Validates per-checkpoint disk display, automatic staging directory creation, disk validation against the target checkpoint's disk set, correct clone file prediction, and single-disk restore of removed disks. Tested across both active and archived chains with disk-removal patterns (18 tests, 100% pass).
-- **Single-disk restore** — replace a single disk via `--disk` on a multi-disk VM, verify `.pre-restore` backup creation, disk integrity, VM boot, and `--no-pre-restore` mode
-- **DR restore** — destroy all 6 VMs (definitions, disks, NVRAM), restore all from backup to a clean path
-- **Post-restore verification** — for every restored VM: UUID and MAC addresses match originals, all disks present and intact (`qemu-img check`), TPM state directory preserved, checkfile survived the full backup → destroy → restore cycle, BitLocker not triggered on Windows VMs
+### Testing Phases
+
+1. **CLI and argument validation** — all vmbackup and vmrestore flags, error paths, privilege enforcement and conflict guards
+2. **Record identities** — UUID, MAC addresses, TPM presence and disk layout for every VM
+3. **Build backup chains with checkfiles** — unique marker files are written inside each guest (Linux and Windows) via the QEMU agent between backup rounds. Multiple vmbackup rounds across both instances create active and archived chains, each capturing different checkfile content. This gives every restore point a verifiable fingerprint — after restore, the checkfile content proves which point in time was actually recovered
+4. **Backup verification** — `vmrestore --verify` confirms integrity across both instances
+5. **Prune** — archived period cleanup on live backup data
+6. **Clone restore** — restore as clones with new identity, verify disk integrity, boot via QEMU agent, confirm checkfile content matches the source backup, then destroy
+7. **Point-in-time restore** — restore to specific checkpoints across both active and archived chains. Each restored VM is booted and the checkfile inside the guest is read back to confirm it contains exactly the content that existed at that point in the backup history — not the latest, not a neighbour, but the precise checkpoint requested. This is the strongest proof that incremental chains and archive navigation produce correct results
+8. **Single-disk restore** — replace one disk on a multi-disk VM, verify `.pre-restore` backup, disk integrity and vmbackup auto-heal after chain invalidation
+9. **Destroy everything** — delete all original VMs including definitions, disks and NVRAM
+10. **DR restore** — restore all VMs from backup to a clean path, verify UUID/MAC match originals, all disks intact, TPM state preserved, checkfiles survived the full backup → destroy → restore cycle, BitLocker not triggered
+11. **Multi-instance backup and restore** — backup and restore across config instances (`--config-instance prod`), verifying that each instance resolves to its own backup path, lists only its own VMs, and restores produce correct identities. Covers `VMBACKUP_INSTANCE` env var equivalence and cross-instance clone and DR
+12. **Windows TPM/BitLocker** — clone and DR with TPM state isolation per UUID, NVRAM separation, archived chain recovery, and BitLocker unlock without recovery prompt
+13. **Auto-recovery** — corrupt `.cpt` chain marker, verify vmbackup archives the broken chain and starts fresh
+
+Every restore verifies disk integrity (`qemu-img check`), identity against pre-test baselines, and successful boot via automated QEMU guest agent polling.
 
 ## Documentation
 

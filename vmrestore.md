@@ -19,7 +19,7 @@
 - Archived chain recovery for any rotation policy (daily, weekly, monthly, accumulate)
 - Dry-run mode to preview every restore before executing
 
-> **Version:** vmrestore v0.5.2
+> **Version:** vmrestore v0.5.3
 > **Underlying tools:** virtnbdrestore v2.28
 
 ---
@@ -51,7 +51,6 @@
     - [9.11 Disk-Only Restore (No VM Definition)](#911-disk-only-restore-no-vm-definition)
     - [9.12 Dry Run](#912-dry-run)
     - [9.13 Verify and Dump](#913-verify-and-dump)
-    - [9.14 Host Configuration Restore](#914-host-configuration-restore)
 10. [Restore Walkthroughs by Policy](#10-restore-walkthroughs-by-policy)
     - [10.1 Weekly Rotation Policy](#101-weekly-rotation-policy)
     - [10.2 Daily Rotation Policy](#102-daily-rotation-policy)
@@ -130,15 +129,15 @@ sudo apt install virtnbdbackup
 vmrestore does **not** require [vmbackup](https://github.com/doutsis/vmbackup) to be installed. It needs two things:
 
 1. **Access to the backup storage** — the directory tree containing `.data` files, config XMLs, TPM state, and NVRAM files that vmbackup created
-2. **The backup path** — either passed explicitly via `--backup-path`, or resolved automatically from vmbackup's config file (`/opt/vmbackup/config/default/vmbackup.conf`) if vmbackup happens to be installed on the same host
+2. **The backup path** — either passed explicitly via `--backup-path`, or resolved automatically from vmbackup's config file. By default vmrestore reads `/opt/vmbackup/config/default/vmbackup.conf`; use `--config-instance <name>` or set the `VMBACKUP_INSTANCE` environment variable to select a different instance
 
 vmrestore does not source any vmbackup modules, does not write to vmbackup's database, and has no runtime coupling to vmbackup. It is a self-contained script that reads vmbackup's on-disk output format.
 
 ### From GitHub Release (.deb) — Recommended
 
 ```bash
-wget https://github.com/doutsis/vmrestore/releases/download/v0.5.1/vmrestore_0.5.1_all.deb
-sudo dpkg -i vmrestore_0.5.1_all.deb
+wget https://github.com/doutsis/vmrestore/releases/download/v0.5.3/vmrestore_0.5.3_all.deb
+sudo dpkg -i vmrestore_0.5.3_all.deb
 ```
 
 ### From Source (any distro)
@@ -155,7 +154,7 @@ sudo make install
 git clone https://github.com/doutsis/vmrestore.git
 cd vmrestore
 make package
-sudo dpkg -i build/vmrestore_0.5.1_all.deb
+sudo dpkg -i build/vmrestore_0.5.2_all.deb
 ```
 
 ### Uninstall
@@ -218,9 +217,11 @@ vmrestore resolves the backup root using a two-step cascade:
 | Priority | Source | Example |
 |----------|--------|---------|
 | 1 | `--backup-path` CLI argument | `--backup-path /mnt/raid/backups/vm` |
-| 2 | `BACKUP_PATH=` in `/opt/vmbackup/config/default/vmbackup.conf` | Standard vmbackup install location |
+| 2 | `--config-instance` CLI flag | `--config-instance prod` reads `/opt/vmbackup/config/prod/vmbackup.conf` |
+| 3 | `VMBACKUP_INSTANCE` environment variable | `VMBACKUP_INSTANCE=prod vmrestore --list` |
+| 4 | Default config | `BACKUP_PATH=` in `/opt/vmbackup/config/default/vmbackup.conf` |
 
-If neither provides a value, vmrestore exits with an error directing you to use `--backup-path` or configure vmbackup.
+If none of these provides a value, vmrestore exits with an error directing you to use `--backup-path` or configure vmbackup.
 
 If vmbackup is already installed and configured, vmrestore will automatically pick up its configuration — no additional setup is needed.
 
@@ -363,7 +364,7 @@ vmrestore auto-detects nearly everything it needs from the backup structure. The
 
 | What | How | Override |
 |------|-----|----------|
-| **Backup path** | Reads `BACKUP_PATH` from vmbackup's config (`/opt/vmbackup/config/default/vmbackup.conf`) | `--backup-path` |
+| **Backup path** | Reads `BACKUP_PATH` from vmbackup's config (default: `/opt/vmbackup/config/default/vmbackup.conf`) | `--backup-path`, `--config-instance` |
 | **VM location** | `--vm my-vm` looks for `{BACKUP_PATH}/my-vm/`. Alternatively, `--vm /full/path/to/backups/my-vm` uses the path directly. | — |
 | **Backup type** | Scans for `*.inc.*.data` (incremental), `*.full.data` (full), or `*.copy.data` (copy) | — |
 | **Accumulate vs periodic** | If data files exist at the VM root (no period subdirectories), accumulate layout is assumed | — |
@@ -966,18 +967,6 @@ sudo vmrestore --dump my-vm --period 2026-W09
 ```
 
 Both commands pass through to `virtnbdrestore -o verify` and `virtnbdrestore -o dump` respectively.
-
-### 9.14 Host Configuration Restore
-
-> **Warning — untested feature.** This is not a host backup. The `__HOST_CONFIG__` archive contains configuration for libvirt/KVM dependent components only: `/etc/libvirt`, `/var/lib/libvirt/{qemu,network,storage,secrets,dnsmasq}`, and host network configuration (`/etc/network/`, `/etc/NetworkManager/system-connections/`). If used to restore, the outcomes are unknown. Always use `--dry-run` to inspect the archive contents before attempting a restore.
-
-Restore the host-level `/etc/libvirt` configuration from the `__HOST_CONFIG__` backup:
-
-```bash
-sudo vmrestore --host-config
-```
-
-This stops `libvirtd`, extracts the latest `__HOST_CONFIG__` tar.gz archive to `/`, and restarts `libvirtd`. Use `--dry-run` to preview first.
 
 ---
 ## 10. Restore Walkthroughs by Policy
@@ -2095,9 +2084,6 @@ sudo vmrestore --vm my-vm --restore-path /tmp/restore --skip-config
 
 # Dry run (preview without executing)
 sudo vmrestore --vm my-vm --restore-path /tmp/restore --dry-run
-
-# Restore host /etc/libvirt configuration
-sudo vmrestore --host-config
 ```
 
 ### Post-Restore
@@ -2119,7 +2105,7 @@ done
 
 ---
 
-*vmrestore v0.5.2 — Part of the [vmbackup](https://github.com/doutsis/vmbackup) ecosystem*
+*vmrestore v0.5.3 — Part of the [vmbackup](https://github.com/doutsis/vmbackup) ecosystem*
 
 <p align="center">
   <img src="docs/vibe-coded.png" alt="Vibe Coded" />

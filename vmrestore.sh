@@ -59,7 +59,6 @@
 #   Disk Collision Protection  Predict output files, check for conflicts
 #   Core Restore             Main restore_vm() orchestration function
 #   Verify / Dump            --verify checksum validation, --dump output
-#   Host Configuration       --host-config libvirt config restore
 #   Usage                    --help output
 #   CLI Parsing              Argument parsing and validation
 #   Main                     Entry point, mode dispatch
@@ -89,7 +88,7 @@
 
 set -uo pipefail
 
-readonly VERSION="0.5.2"
+readonly VERSION="0.5.3"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -187,13 +186,17 @@ run_logged() {
 # ── Configuration ────────────────────────────────────────────────────────────
 
 resolve_backup_path() {
-    # Cascade: --backup-path CLI > vmbackup.conf
+    # Cascade: --backup-path CLI > vmbackup.conf (instance-aware)
     if [[ -n "${BACKUP_PATH_CLI:-}" ]]; then
         echo "$BACKUP_PATH_CLI"
         return
     fi
-    # Read from vmbackup's default instance configuration
-    local conf="/opt/vmbackup/config/default/vmbackup.conf"
+    # Determine config instance: CLI flag > env var > default
+    local instance="${OPT_CONFIG_INSTANCE:-${VMBACKUP_INSTANCE:-default}}"
+    local conf="/opt/vmbackup/config/${instance}/vmbackup.conf"
+    if [[ ! -f "$conf" && "$instance" != "default" ]]; then
+        die "Config instance '$instance' not found: $conf" "resolve_backup_path"
+    fi
     if [[ -f "$conf" ]]; then
         local val
         val=$(grep -oP '^\s*BACKUP_PATH\s*=\s*["'\''"]?\K[^"'\''"\s]+' "$conf" 2>/dev/null || true)
@@ -202,7 +205,7 @@ resolve_backup_path() {
             return
         fi
     fi
-    die "Cannot resolve backup path. Use --backup-path or install vmbackup with a configured BACKUP_PATH in /opt/vmbackup/config/default/vmbackup.conf" "resolve_backup_path"
+    die "Cannot resolve backup path. Use --backup-path or install vmbackup with a configured BACKUP_PATH in /opt/vmbackup/config/${instance}/vmbackup.conf" "resolve_backup_path"
 }
 
 # ── Pre-flight Free Space Check ─────────────────────────────────────────────
@@ -413,7 +416,7 @@ list_vms() {
         [[ -d "$vm_dir" ]] || continue
         local vm
         vm=$(basename "$vm_dir")
-        [[ "$vm" == __HOST_CONFIG__ || "$vm" == _state ]] && continue
+        [[ "$vm" == _state ]] && continue
 
         local data_dir=""
         local periods=()
@@ -519,26 +522,6 @@ list_vms() {
 
         ((found++))
     done
-
-    # Host config
-    local hdir="$backup_path/__HOST_CONFIG__"
-    if [[ -d "$hdir" ]]; then
-        local hc_lines=""
-        for mdir in "$hdir"/*/; do
-            [[ -d "$mdir" ]] || continue
-            local mname count
-            mname=$(basename "$mdir")
-            count=$(find "$mdir" -name "*.tar.gz" 2>/dev/null | wc -l)
-            hc_lines+=$(printf "    %s: %d backup(s)\n" "$mname" "$count")
-            hc_lines+=$'\n'
-        done
-        if [[ -n "$hc_lines" ]]; then
-            echo ""
-            echo "  __HOST_CONFIG__"
-            printf "%s" "$hc_lines"
-            ((found++))
-        fi
-    fi
 
     echo ""
     echo "══════════════════════════════════════════════════════════════"
@@ -2067,48 +2050,11 @@ run_virtnbd_action() {
     run_logged virtnbdrestore -i "$data_dir" -o "$action"
 }
 
-# ── Host Configuration ──────────────────────────────────────────────────────
-
-restore_host_config() {
-    local backup_path="$1"
-    local hdir="$backup_path/__HOST_CONFIG__"
-
-    [[ -d "$hdir" ]] || die "Host config not found: $hdir" "restore_host_config"
-
-    # Latest tar.gz across month subdirs
-    local config_file
-    config_file=$(find "$hdir" -name "*.tar.gz" -type f 2>/dev/null | sort -rV | head -1)
-    [[ -n "$config_file" ]] || die "No host config archives found" "restore_host_config"
-
-    log_info "restore_host_config" "Found: $config_file"
-    tar tzf "$config_file" &>/dev/null || die "Corrupted archive: $config_file" "restore_host_config"
-
-    local target="$OPT_HOST_TARGET"
-
-    if [[ "$OPT_DRY_RUN" == true ]]; then
-        log_info "restore_host_config" "[DRY RUN] Would extract $config_file to $target"
-        return 0
-    fi
-
-    log_warn "restore_host_config" "Restoring host config to $target (stops libvirtd)"
-    systemctl stop libvirtd
-    sleep 2
-
-    if ! tar xzf "$config_file" -C "$target"; then
-        systemctl start libvirtd
-        die "Extraction failed" "restore_host_config"
-    fi
-
-    systemctl start libvirtd
-    sleep 2
-    log_info "restore_host_config" "Host config restored"
-}
-
 # ── Usage ────────────────────────────────────────────────────────────────────
 
 usage() {
+    echo "vmrestore.sh v${VERSION} — Automated VM restoration wrapping virtnbdrestore"
     cat << 'EOF'
-vmrestore.sh v0.5.1 — Automated VM restoration wrapping virtnbdrestore
 
 USAGE:
   vmrestore.sh --vm <name|path> --restore-path <path> [options]
@@ -2117,7 +2063,6 @@ USAGE:
   vmrestore.sh --list-restore-points <name|path> [--period <id>]
   vmrestore.sh --verify <name> [--period <id>]
   vmrestore.sh --dump <name> [--period <id>]
-  vmrestore.sh --host-config [--backup-path <path>]
 
 RESTORE:
   --vm <name|path>       VM to restore (name or full path to backup dir)
@@ -2145,7 +2090,8 @@ INSPECTION:
   --list-restore-points  Show available restore points
   --verify <name>        Checksum validation (virtnbdrestore -o verify)
   --dump <name>          Backup metadata (virtnbdrestore -o dump)
-  --host-config          Restore host /etc/libvirt configuration
+  --config-instance <n>  Use named vmbackup config instance (default: default)
+                         Also reads VMBACKUP_INSTANCE env var as fallback
 
 EXAMPLES:
   # Disaster recovery — rebuild VM with original identity
@@ -2193,6 +2139,7 @@ OPT_MODE=""
 OPT_VM_NAME=""
 OPT_BACKUP_PATH=""
 BACKUP_PATH_CLI=""
+OPT_CONFIG_INSTANCE=""
 OPT_RESTORE_PATH=""
 OPT_PERIOD=""
 OPT_RESTORE_POINT="latest"
@@ -2203,7 +2150,6 @@ OPT_SKIP_TPM=false
 OPT_FORCE=false
 OPT_DRY_RUN=false
 OPT_NO_PRE_RESTORE=false
-OPT_HOST_TARGET="/"
 
 parse_args() {
     [[ $# -eq 0 ]] && usage
@@ -2237,9 +2183,6 @@ parse_args() {
                     shift
                 fi
                 shift ;;
-            --host-config)
-                OPT_MODE="host-config"
-                shift ;;
             --verify)
                 OPT_MODE="verify"
                 OPT_VM_NAME="${2:?'--verify requires a VM name'}"
@@ -2250,6 +2193,9 @@ parse_args() {
                 shift 2 ;;
             --backup-path)
                 BACKUP_PATH_CLI="${2:?'--backup-path requires a path'}"
+                shift 2 ;;
+            --config-instance)
+                OPT_CONFIG_INSTANCE="${2:?'--config-instance requires an instance name'}"
                 shift 2 ;;
             --restore-path)
                 OPT_RESTORE_PATH="${2:?'--restore-path requires a path'}"
@@ -2271,9 +2217,6 @@ parse_args() {
             --force)          OPT_FORCE=true; shift ;;
             --dry-run)        OPT_DRY_RUN=true; shift ;;
             --no-pre-restore) OPT_NO_PRE_RESTORE=true; shift ;;
-            --host-target)
-                OPT_HOST_TARGET="${2:?'--host-target requires a path'}"
-                shift 2 ;;
             --help|-h)        usage ;;
             --version|-V)     echo "vmrestore $VERSION"; exit 0 ;;
             *)                die "Unknown option: $1" "parse_args" ;;
@@ -2417,10 +2360,6 @@ main() {
 
         dump)
             run_virtnbd_action "dump" "$OPT_VM_NAME" || rc=$?
-            ;;
-
-        host-config)
-            restore_host_config "$OPT_BACKUP_PATH"
             ;;
 
         *)

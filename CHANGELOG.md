@@ -4,6 +4,20 @@ All notable changes to [vmrestore](https://github.com/doutsis/vmrestore) will be
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] - 2026-04-12
+
+### Fixed
+
+- **`--help` showed wrong version** — `usage()` hardcoded `v0.5.1` while `--version` showed `0.5.2`. Version string now uses `$VERSION` variable.
+
+### Removed
+
+- **`--host-config` removed** — Host config backup was removed in vmbackup v0.5.3. The `--host-config` flag, `restore_host_config()` function, and `__HOST_CONFIG__` display in `--list` output have been stripped entirely. The `--host-target` flag is also removed.
+
+### Added
+
+- **`--config-instance` flag** — Select a named vmbackup config instance (e.g., `--config-instance prod`). Also reads `VMBACKUP_INSTANCE` environment variable as fallback. Exits with an error if the specified instance directory does not exist. Resolves hardcoded `/opt/vmbackup/config/default/vmbackup.conf` path for multi-instance deployments.
+
 ## [0.5.2] - 2026-03-29
 
 ### Changed
