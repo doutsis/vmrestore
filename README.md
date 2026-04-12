@@ -1,4 +1,4 @@
-# vmrestore
+# vmrestore — KVM/libvirt VM Restore & Disaster Recovery
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/doutsis/vmrestore)](https://github.com/doutsis/vmrestore/releases)
