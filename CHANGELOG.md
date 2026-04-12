@@ -16,7 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ### Added
 
-- **`--config-instance` flag** — Select a named vmbackup config instance (e.g., `--config-instance prod`). Also reads `VMBACKUP_INSTANCE` environment variable as fallback. Exits with an error if the specified instance directory does not exist. Resolves hardcoded `/opt/vmbackup/config/default/vmbackup.conf` path for multi-instance deployments.
+- **`--config-instance` flag** — Select a named vmbackup config instance (e.g., `--config-instance prod`). Falls back to `VMBACKUP_INSTANCE` environment variable, then `default`. Exits with an error if the specified instance does not exist.
 
 ## [0.5.2] - 2026-03-29
 
