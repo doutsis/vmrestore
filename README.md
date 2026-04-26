@@ -286,9 +286,7 @@ for cp in $(sudo virsh checkpoint-list my-vm --name 2>/dev/null); do
 done
 ```
 
-## Installation
-
-### Uninstall
+## Uninstall
 
 **Debian / Ubuntu (.deb install):**
 
