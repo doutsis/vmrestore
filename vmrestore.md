@@ -19,7 +19,7 @@
 - Archived chain recovery for any rotation policy (daily, weekly, monthly, accumulate)
 - Dry-run mode to preview every restore before executing
 
-> **Version:** vmrestore v0.5.3
+> **Version:** vmrestore v0.5.4
 > **Underlying tools:** virtnbdrestore v2.28
 
 ---
@@ -62,6 +62,7 @@
 14. [Post-Restore Steps](#14-post-restore-steps)
 15. [Troubleshooting](#15-troubleshooting)
 16. [Quick Reference Commands](#16-quick-reference-commands)
+17. [Exit Codes](#17-exit-codes)
 
 ---
 
@@ -136,8 +137,8 @@ vmrestore does not source any vmbackup modules, does not write to vmbackup's dat
 ### From GitHub Release (.deb) — Recommended
 
 ```bash
-wget https://github.com/doutsis/vmrestore/releases/download/v0.5.3/vmrestore_0.5.3_all.deb
-sudo dpkg -i vmrestore_0.5.3_all.deb
+wget https://github.com/doutsis/vmrestore/releases/download/v0.5.4/vmrestore_0.5.4_all.deb
+sudo dpkg -i vmrestore_0.5.4_all.deb
 ```
 
 ### From Source (any distro)
@@ -154,7 +155,7 @@ sudo make install
 git clone https://github.com/doutsis/vmrestore.git
 cd vmrestore
 make package
-sudo dpkg -i build/vmrestore_0.5.2_all.deb
+sudo dpkg -i build/vmrestore_0.5.4_all.deb
 ```
 
 ### Uninstall
@@ -2104,8 +2105,29 @@ done
 ```
 
 ---
+## 17. Exit Codes
 
-*vmrestore v0.5.3 — Part of the [vmbackup](https://github.com/doutsis/vmbackup) ecosystem*
+`vmrestore` returns categorised exit codes so monitoring systems can distinguish *why* a run failed without scraping logs. Backward-compatible — `if vmrestore; then` and `(( $? != 0 ))` patterns continue to work.
+
+| Code | Meaning | Example trigger |
+|------|---------|-----------------|
+| 0    | Success | Normal completion, `--help`, `--version` |
+| 1    | General error | Catch-all for uncategorised failure |
+| 2    | Configuration error | Named config instance does not exist, missing required path |
+| 3    | Lock conflict | (Reserved — vmrestore does not currently take a process lock) |
+| 4    | Storage error | Backup path missing, insufficient space, `.pre-restore` file already exists |
+| 5    | VM problem | VM not found, VM in wrong state, disk not in chain at requested checkpoint |
+| 6    | External tool failure | `virtnbdrestore` returned non-zero |
+| 7    | CLI usage error | Unknown flag, missing required argument, invalid `--restore-point` value |
+| 8    | Missing dependency | (Reserved — surface manifests as tool failure today) |
+| 130  | SIGINT (Ctrl-C) | Shell convention 128 + 2 |
+| 143  | SIGTERM | Shell convention 128 + 15 |
+
+Symmetric with `vmbackup` — the same number means the same category in both tools, so monitoring rules can be written once and applied to either binary.
+
+---
+
+*vmrestore v0.5.4 — Part of the [vmbackup](https://github.com/doutsis/vmbackup) ecosystem*
 
 <p align="center">
   <img src="docs/vibe-coded.png" alt="Vibe Coded" />

@@ -4,6 +4,12 @@ All notable changes to [vmrestore](https://github.com/doutsis/vmrestore) will be
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] - 2026-04-26
+
+### Changed
+
+- **Structured exit codes** — categorised non-zero exits (config / storage / VM / tool / CLI / dependency) let monitoring distinguish *why* a run failed without parsing logs. Symmetric with vmbackup.
+
 ## [0.5.3] - 2026-04-12
 
 ### Fixed

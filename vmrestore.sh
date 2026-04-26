@@ -88,7 +88,19 @@
 
 set -uo pipefail
 
-readonly VERSION="0.5.3"
+readonly VERSION="0.5.4"
+
+# ----- Exit codes -----
+# Categorised exit codes for monitoring integration. Symmetric with vmbackup.
+readonly EXIT_OK=0
+readonly EXIT_ERROR=1
+readonly EXIT_CONFIG=2
+readonly EXIT_LOCK=3
+readonly EXIT_STORAGE=4
+readonly EXIT_VM=5
+readonly EXIT_TOOL=6
+readonly EXIT_USAGE=7
+readonly EXIT_DEPENDENCY=8
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -168,13 +180,13 @@ log_completion_summary() {
 _log() {
     local level="$1" fn="$2" msg="$3"
     local line="[$(date '+%Y-%m-%d %H:%M:%S')] [vmrestore] [$fn] $level: $msg"
-    echo "$line" >> "$LOG_FILE"
+    [[ -n "$LOG_FILE" ]] && echo "$line" >> "$LOG_FILE"
     echo "$line" >&2
 }
 log_info()  { _log "INFO"  "$1" "$2"; }
 log_warn()  { _log "WARN"  "$1" "$2"; }
 log_error() { _log "ERROR" "$1" "$2"; }
-die()       { log_error "${2:-main}" "$1"; exit 1; }
+die()       { log_error "${2:-main}" "$1"; exit "${3:-$EXIT_ERROR}"; }
 
 # Run a command, teeing all output (stdout+stderr) into the log file
 # while still displaying on the terminal. Returns the command's exit code.
@@ -195,7 +207,7 @@ resolve_backup_path() {
     local instance="${OPT_CONFIG_INSTANCE:-${VMBACKUP_INSTANCE:-default}}"
     local conf="/opt/vmbackup/config/${instance}/vmbackup.conf"
     if [[ ! -f "$conf" && "$instance" != "default" ]]; then
-        die "Config instance '$instance' not found: $conf" "resolve_backup_path"
+        die "Config instance '$instance' not found: $conf" "resolve_backup_path" "$EXIT_CONFIG"
     fi
     if [[ -f "$conf" ]]; then
         local val
@@ -205,7 +217,7 @@ resolve_backup_path() {
             return
         fi
     fi
-    die "Cannot resolve backup path. Use --backup-path or install vmbackup with a configured BACKUP_PATH in /opt/vmbackup/config/${instance}/vmbackup.conf" "resolve_backup_path"
+    die "Cannot resolve backup path. Use --backup-path or install vmbackup with a configured BACKUP_PATH in /opt/vmbackup/config/${instance}/vmbackup.conf" "resolve_backup_path" "$EXIT_CONFIG"
 }
 
 # ── Pre-flight Free Space Check ─────────────────────────────────────────────
@@ -296,7 +308,7 @@ preflight_free_space() {
     log_info "preflight_free_space" "Backup data: $total_hr ($file_count files) — Destination free: $avail_hr ($check_path)"
 
     if (( total_bytes > avail_bytes )); then
-        die "Insufficient space: restore needs $total_hr but only $avail_hr available on $check_path" "preflight_free_space"
+        die "Insufficient space: restore needs $total_hr but only $avail_hr available on $check_path" "preflight_free_space" "$EXIT_STORAGE"
     fi
 
     # Warn if less than 10% headroom (restored qcow2 can be larger than raw data)
@@ -1066,7 +1078,7 @@ preflight_disk_safety() {
             log_warn "preflight_disk_safety" "[DRY RUN] Would abort due to safety checks above"
             return 0
         fi
-        die "Pre-flight disk safety check failed — see errors above" "preflight_disk_safety"
+        die "Pre-flight disk safety check failed — see errors above" "preflight_disk_safety" "$EXIT_STORAGE"
     fi
 
     log_info "preflight_disk_safety" "${dry_tag}All safety checks passed"
@@ -1145,12 +1157,12 @@ restore_vm() {
         log_info "restore_vm" "Using direct backup path: $data_dir"
     else
         local vm_dir="$OPT_BACKUP_PATH/$vm_name"
-        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "restore_vm"
+        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "restore_vm" "$EXIT_VM"
         data_dir=$(resolve_data_dir "$vm_dir" "${OPT_PERIOD:-}") || \
-            die "Cannot resolve data directory for $vm_name" "restore_vm"
+            die "Cannot resolve data directory for $vm_name" "restore_vm" "$EXIT_VM"
     fi
 
-    has_backup_data "$data_dir" || die "No backup data files in: $data_dir" "restore_vm"
+    has_backup_data "$data_dir" || die "No backup data files in: $data_dir" "restore_vm" "$EXIT_VM"
 
     # If --vm pointed to an archive chain or period directory, vm_name will be
     # the directory basename (e.g. "chain-2026-03-12").  Extract the real VM
@@ -1188,7 +1200,7 @@ restore_vm() {
         available_disks=$(enumerate_disks "$data_dir")
 
         if [[ -z "$available_disks" ]]; then
-            die "No disks found in backup: $data_dir" "restore_vm"
+            die "No disks found in backup: $data_dir" "restore_vm" "$EXIT_VM"
         fi
 
         # Parse --disk value into array: single name, comma-separated, or "all"
@@ -1209,7 +1221,7 @@ restore_vm() {
         fi
 
         if [[ ${#disk_list[@]} -eq 0 ]]; then
-            die "No disk names specified" "restore_vm"
+            die "No disk names specified" "restore_vm" "$EXIT_USAGE"
         fi
 
         # Validate all disk names against available disks (union across all CPs)
@@ -1221,7 +1233,7 @@ restore_vm() {
             done
             unset IFS
             if [[ "$_found" == false ]]; then
-                die "Disk '$_d' not found in backup. Available disks: $available_disks" "restore_vm"
+                die "Disk '$_d' not found in backup. Available disks: $available_disks" "restore_vm" "$EXIT_VM"
             fi
         done
 
@@ -1262,9 +1274,9 @@ restore_vm() {
                             fi
                         done
                         if [[ -n "$_last_seen" ]]; then
-                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks). It was last backed up at checkpoint $_last_seen. Use --restore-point $_last_seen to restore this disk." "restore_vm"
+                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks). It was last backed up at checkpoint $_last_seen. Use --restore-point $_last_seen to restore this disk." "restore_vm" "$EXIT_VM"
                         else
-                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks)." "restore_vm"
+                            die "Disk '$_d' is not available at checkpoint $_target_cp (disks: $_cp_disks)." "restore_vm" "$EXIT_VM"
                         fi
                     fi
                 done
@@ -1281,12 +1293,12 @@ restore_vm() {
         if [[ -z "$OPT_RESTORE_PATH" ]]; then
             _inplace=true
             if ! virsh dominfo "$vm_name" &>/dev/null; then
-                die "VM '$vm_name' is not defined in libvirt — cannot determine original disk paths. Use --restore-path to extract disks to a specific location instead." "restore_vm"
+                die "VM '$vm_name' is not defined in libvirt — cannot determine original disk paths. Use --restore-path to extract disks to a specific location instead." "restore_vm" "$EXIT_VM"
             fi
             local vm_state
             vm_state=$(virsh domstate "$vm_name" 2>/dev/null | tr -d '[:space:]')
             if [[ "$vm_state" != "shutoff" ]]; then
-                die "VM '$vm_name' is $vm_state — shut it down first (virsh shutdown $vm_name). Replacing disks under a running VM will cause corruption." "restore_vm"
+                die "VM '$vm_name' is $vm_state — shut it down first (virsh shutdown $vm_name). Replacing disks under a running VM will cause corruption." "restore_vm" "$EXIT_VM"
             fi
             log_info "restore_vm" "VM '$vm_name' is shut off ✓"
         else
@@ -1312,14 +1324,14 @@ restore_vm() {
                 _opath=$(echo "$_vm_xml" | grep -B5 "target dev='$_d'" | \
                     grep -oP "source file='\K[^']+" | head -1 || true)
                 if [[ -z "$_opath" ]]; then
-                    die "Disk '$_d' not found in VM '$vm_name' configuration. Available disks: $(virsh domblklist "$vm_name" --details 2>/dev/null | awk '$2=="disk"{print $3}' | paste -sd', ')" "restore_vm"
+                    die "Disk '$_d' not found in VM '$vm_name' configuration. Available disks: $(virsh domblklist "$vm_name" --details 2>/dev/null | awk '$2=="disk"{print $3}' | paste -sd', ')" "restore_vm" "$EXIT_VM"
                 fi
                 if [[ ! -f "$_opath" ]]; then
-                    die "Original disk path does not exist: $_opath — Use --restore-path to extract disks to a specific location instead." "restore_vm"
+                    die "Original disk path does not exist: $_opath — Use --restore-path to extract disks to a specific location instead." "restore_vm" "$EXIT_STORAGE"
                 fi
                 # Check for .pre-restore overwrite
                 if [[ -f "${_opath}.pre-restore" && "$OPT_NO_PRE_RESTORE" == false ]]; then
-                    die "Pre-restore file already exists: ${_opath}.pre-restore — delete it first or use --no-pre-restore" "restore_vm"
+                    die "Pre-restore file already exists: ${_opath}.pre-restore — delete it first or use --no-pre-restore" "restore_vm" "$EXIT_STORAGE"
                 fi
                 _dk_path[$_d]="$_opath"
                 _dk_dir[$_d]=$(dirname "$_opath")
@@ -1364,7 +1376,7 @@ restore_vm() {
             local need_hr avail_hr
             need_hr=$(numfmt --to=iec-i --suffix=B "$total_needed" 2>/dev/null || echo "$total_needed bytes")
             avail_hr=$(numfmt --to=iec-i --suffix=B "$avail_bytes" 2>/dev/null || echo "$avail_bytes bytes")
-            die "Insufficient space: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm"
+            die "Insufficient space: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm" "$EXIT_STORAGE"
         fi
         local data_hr
         data_hr=$(numfmt --to=iec-i --suffix=B "$total_data_bytes" 2>/dev/null || echo "$total_data_bytes bytes")
@@ -1400,7 +1412,7 @@ restore_vm() {
                     log_warn "restore_vm" "  Restoring with checkpoint $_pit_target_cp disk configuration."
                     if [[ "$OPT_DRY_RUN" == false ]]; then
                         pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
-                            die "Failed to create PIT staging directory" "restore_vm"
+                            die "Failed to create PIT staging directory" "restore_vm" "$EXIT_STORAGE"
                         log_info "restore_vm" "PIT staging directory: $pit_input_dir"
                     fi
                 fi
@@ -1470,7 +1482,7 @@ restore_vm() {
                 case "$OPT_RESTORE_POINT" in
                     full)    until_cp="virtnbdbackup.0" ;;
                     [0-9]*)  until_cp="virtnbdbackup.$OPT_RESTORE_POINT" ;;
-                    *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" ;;
+                    *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" "$EXIT_USAGE" ;;
                 esac
                 disk_cmd+=(--until "$until_cp")
                 [[ $_disk_idx -eq 1 ]] && log_info "restore_vm" "Point-in-time: $until_cp"
@@ -1569,7 +1581,7 @@ restore_vm() {
                 done
             fi
             cleanup_pit_staging "$pit_input_dir"
-            die "Disk restore failed for $_failed_disk" "restore_vm"
+            die "Disk restore failed for $_failed_disk" "restore_vm" "$EXIT_TOOL"
         fi
 
         # Checkpoint invalidation warning (once)
@@ -1666,7 +1678,7 @@ restore_vm() {
                     virsh undefine "$check_name" 2>/dev/null || \
                     log_warn "restore_vm" "Failed to undefine '$check_name' — continuing anyway"
             else
-                die "VM '$check_name' already defined (use --force to override)" "restore_vm"
+                die "VM '$check_name' already defined (use --force to override)" "restore_vm" "$EXIT_VM"
             fi
         fi
 
@@ -1699,7 +1711,7 @@ restore_vm() {
         case "$OPT_RESTORE_POINT" in
             full)    until_cp="virtnbdbackup.0" ;;
             [0-9]*)  until_cp="virtnbdbackup.$OPT_RESTORE_POINT" ;;
-            *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" ;;
+            *)       die "Invalid restore point: $OPT_RESTORE_POINT (use latest, full, or number)" "restore_vm" "$EXIT_USAGE" ;;
         esac
         cmd+=(--until "$until_cp")
         log_info "restore_vm" "Point-in-time: $until_cp"
@@ -1731,7 +1743,7 @@ restore_vm() {
                 log_warn "restore_vm" "  Restoring with checkpoint $_pit_target_cp disk configuration."
                 if [[ "$OPT_DRY_RUN" == false ]]; then
                     pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
-                        die "Failed to create PIT staging directory" "restore_vm"
+                        die "Failed to create PIT staging directory" "restore_vm" "$EXIT_STORAGE"
                     log_info "restore_vm" "PIT staging directory: $pit_input_dir"
                     # Replace -i in cmd array: element 0=virtnbdrestore, 1=-i, 2=data_dir
                     cmd[2]="$pit_input_dir"
@@ -1850,12 +1862,12 @@ restore_vm() {
                 # Clean up staging dirs on failure before dying
                 [[ -n "$staging_dir" && -d "$staging_dir" ]] && rm -rf "$staging_dir"
                 cleanup_pit_staging "$pit_input_dir"
-                die "Disk restore failed" "restore_vm"
+                die "Disk restore failed" "restore_vm" "$EXIT_TOOL"
             fi
         else
             [[ -n "$staging_dir" && -d "$staging_dir" ]] && rm -rf "$staging_dir"
             cleanup_pit_staging "$pit_input_dir"
-            die "Disk restore failed" "restore_vm"
+            die "Disk restore failed" "restore_vm" "$EXIT_TOOL"
         fi
 
         # Move + rename clone disks from staging to final location
@@ -1976,7 +1988,7 @@ restore_vm() {
             done
             if [[ "$_any_corrupt" == true ]]; then
                 log_error "restore_vm" "One or more restored images are corrupt (possible ENOSPC or I/O error)"
-                die "Restore produced corrupt disk images" "restore_vm"
+                die "Restore produced corrupt disk images" "restore_vm" "$EXIT_STORAGE"
             fi
         fi
 
@@ -2041,9 +2053,9 @@ run_virtnbd_action() {
         data_dir="$OPT_BACKUP_PATH"
     else
         local vm_dir="$OPT_BACKUP_PATH/$vm_name"
-        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "run_virtnbd_action"
+        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "run_virtnbd_action" "$EXIT_VM"
         data_dir=$(resolve_data_dir "$vm_dir" "${OPT_PERIOD:-}") || \
-            die "Cannot resolve data directory" "run_virtnbd_action"
+            die "Cannot resolve data directory" "run_virtnbd_action" "$EXIT_VM"
     fi
 
     log_info "run_virtnbd_action" "Running $action on: $data_dir"
@@ -2219,15 +2231,15 @@ parse_args() {
             --no-pre-restore) OPT_NO_PRE_RESTORE=true; shift ;;
             --help|-h)        usage ;;
             --version|-V)     echo "vmrestore $VERSION"; exit 0 ;;
-            *)                die "Unknown option: $1" "parse_args" ;;
+            *)                die "Unknown option: $1" "parse_args" "$EXIT_USAGE" ;;
         esac
     done
 
-    OPT_BACKUP_PATH=$(resolve_backup_path)
+    OPT_BACKUP_PATH=$(resolve_backup_path) || exit $?
 
     # Validate incompatible flag combinations
     if [[ -n "${OPT_DISK:-}" && -n "${OPT_NAME:-}" ]]; then
-        die "--disk and --name cannot be combined (disk restore replaces disk files, it does not create a VM)" "parse_args"
+        die "--disk and --name cannot be combined (disk restore replaces disk files, it does not create a VM)" "parse_args" "$EXIT_USAGE"
     fi
 
     # Normalise paths: strip trailing slashes to avoid ugly double-slash //
@@ -2337,14 +2349,14 @@ main() {
     finalize_log_name
     log_invocation_summary
     log_info "main" "====== vmrestore v$VERSION ======"
-    [[ -d "$OPT_BACKUP_PATH" ]] || die "Backup path not found: $OPT_BACKUP_PATH" "main"
+    [[ -d "$OPT_BACKUP_PATH" ]] || die "Backup path not found: $OPT_BACKUP_PATH" "main" "$EXIT_STORAGE"
 
     local rc=0
     case "$OPT_MODE" in
         restore)
             # --disk without --restore-path = in-place disk replacement (no --restore-path needed)
             if [[ -z "$OPT_RESTORE_PATH" && -z "${OPT_DISK:-}" ]]; then
-                die "--restore-path is required for restore (unless --disk is used for in-place replacement)" "main"
+                die "--restore-path is required for restore (unless --disk is used for in-place replacement)" "main" "$EXIT_USAGE"
             fi
             restore_vm "$OPT_VM_NAME"
             ;;
@@ -2363,7 +2375,7 @@ main() {
             ;;
 
         *)
-            die "No mode specified (try --help)" "main"
+            die "No mode specified (try --help)" "main" "$EXIT_USAGE"
             ;;
     esac
 

@@ -28,8 +28,8 @@ vmbackup and vmrestore are tested together but coupled to nothing. vmrestore is 
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmrestore/releases/download/v0.5.3/vmrestore_0.5.3_all.deb
-sudo dpkg -i vmrestore_0.5.3_all.deb
+wget https://github.com/doutsis/vmrestore/releases/download/v0.5.4/vmrestore_0.5.4_all.deb
+sudo dpkg -i vmrestore_0.5.4_all.deb
 ```
 
 **Any distro (from source):**
